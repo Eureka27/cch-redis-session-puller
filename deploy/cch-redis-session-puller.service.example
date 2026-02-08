@@ -1,0 +1,14 @@
+[Unit]
+Description=CCH Redis Session Puller
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/cch-redis-session-puller.env
+WorkingDirectory=/path/to/cch-redis-session-puller
+ExecStart=/usr/bin/python3 /path/to/cch-redis-session-puller/src/puller.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

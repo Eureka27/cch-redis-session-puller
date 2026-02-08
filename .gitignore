@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+state.json
+state/
+session/
+tmp_session/
+puller.log
+puller.pid
+.zcf/

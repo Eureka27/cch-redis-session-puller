@@ -1,13 +1,15 @@
 # cch-redis-session-puller
 
-从 Redis 增量拉取会话数据并落盘为 JSONL。
+Incrementally pulls session data from Redis and writes JSONL files.
 
-## 1) 前置：先部署 claude-code-hub
+## 1) Prerequisite
 
-先在源服务器部署：`https://github.com/ding113/claude-code-hub`  
-本项目读取其 Redis 中的 `session:*` 数据。
+Deploy `claude-code-hub` first:  
+`https://github.com/ding113/claude-code-hub`
 
-## 2) 安装与运行
+This puller reads `session:*` keys from Redis.
+
+## 2) Install and run
 
 ```bash
 python3 -m venv .venv
@@ -15,38 +17,40 @@ python3 -m venv .venv
 pip install -r requirements.txt
 ```
 
-环境变量：
+Environment variables:
 
-- `REDIS_URL` (必填) 例如 `redis://localhost:6379/0`
-- `POLL_INTERVAL_SECONDS` (可选，默认 `60`)
-- `DEST_DIR` (可选，默认 `./session`)
-- `STATE_PATH` (可选，默认 `./state/state.json`)
-- `MISSING_SKIP_SECONDS` (可选，默认 `300`)
+- `REDIS_URL` (required), e.g. `redis://localhost:6379/0`
+- `POLL_INTERVAL_SECONDS` (optional, default: `60`)
+- `DEST_DIR` (optional, default: `./session`)
+- `STATE_PATH` (optional, default: `./state/state.json`)
+- `MISSING_SKIP_SECONDS` (optional, default: `300`)
 
-启动：
+Run continuously:
 
 ```bash
 python3 src/puller.py
 ```
 
-单次：
+Run once:
 
 ```bash
 python3 src/puller.py --once
 ```
 
-## 3) 可选：源端空间不足时的分层方案
+## 3) Optional: low-storage source server setup
 
-如果本服务器存储空间有限，可采用：
+If the source server has limited disk space:
 
-- 本服务器部署 `https://github.com/Eureka27/cch-local-pull` 服务端
-- 数据服务器部署 `https://github.com/Eureka27/cch-local-pull` 客户端
+- Deploy `cch-local-pull` server on the source server  
+  `https://github.com/Eureka27/cch-local-pull`
+- Deploy `cch-local-pull` client on a data server  
+  `https://github.com/Eureka27/cch-local-pull`
 
-关键配置：`cch-local-pull` 服务端的 `session_dir` 必须指向本项目的 `DEST_DIR`。  
-例如你部署在 `/home/ubuntu/x-rag/cch-redis-session-puller`，且默认配置不改，则目录为：
+Important: set `cch-local-pull` server `session_dir` to this puller's `DEST_DIR` path  
+(for example: `<puller_dir>/session` if `DEST_DIR` is default).
 
-`/home/ubuntu/x-rag/cch-redis-session-puller/session`
+## 4) Optional: systemd
 
-## 4) systemd（可选）
+Example unit file: `deploy/cch-redis-session-puller.service.example`
 
-示例文件：`deploy/cch-redis-session-puller.service.example`
+Replace `/path/to/cch-redis-session-puller` in the example with your actual deployment path.
