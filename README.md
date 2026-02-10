@@ -2,14 +2,15 @@
 
 Incrementally reads `session:*` keys from Redis and writes JSONL shards.
 
-## What changed
+## Output format
 
-- Per-session append file is removed.
-- Output is now immutable request shards:
-  - `DEST_DIR/<session_id>/req-000001.json`
-  - `DEST_DIR/<session_id>/req-000002.json`
-- Each shard keeps the same JSONL event format as before.
-- Writes are atomic (`.tmp` + rename) and idempotent.
+- Directory per session:
+  - `DEST_DIR/<session_id>/`
+- One immutable file per request:
+  - `req-000001.json`
+  - `req-000002.json`
+- Each file is JSONL and uses the same event schema as the original session file.
+- Writes are atomic (`.tmp` + rename) and idempotent (existing shard is skipped).
 
 ## Install
 
