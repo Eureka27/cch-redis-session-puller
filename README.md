@@ -2,6 +2,24 @@
 
 Incrementally reads `session:*` keys from Redis and writes JSONL shards.
 
+## Prerequisite
+
+Deploy `claude-code-hub` first:  
+`https://github.com/ding113/claude-code-hub`
+
+This puller reads `session:*` keys from Redis.
+
+## Optional: low-storage source server setup
+
+If the source server has limited disk space:
+
+- Deploy `cch-local-pull` server on the source server:  
+  `https://github.com/Eureka27/cch-local-pull`
+- Deploy `cch-local-pull` client on a data server:  
+  `https://github.com/Eureka27/cch-local-pull`
+
+Important: `session_dir` in `cch-local-pull` server must point to this project's `DEST_DIR`.
+
 ## Output format
 
 - Directory per session:
