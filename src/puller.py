@@ -49,68 +49,24 @@ def ensure_dir(path: str) -> None:
     Path(path).mkdir(parents=True, exist_ok=True)
 
 
-def _build_request_file_path(dest_dir: str, session_id: str, seq: int) -> Path:
+def _build_session_file_path(dest_dir: str, session_id: str) -> Path:
     safe_id = sanitize_path_segment(session_id)
-    return Path(dest_dir) / safe_id / f"req-{seq:06d}.json"
+    return Path(dest_dir) / f"{safe_id}.json"
 
 
-def write_request_events_atomic(
-    dest_dir: str, session_id: str, seq: int, events: list[dict]
+def append_session_events(
+    dest_dir: str, session_id: str, events: list[dict]
 ) -> str:
-    """
-    Return values:
-    - "empty": no events, nothing written
-    - "exists": target file already exists, treated as idempotent success
-    - "written": write completed atomically
-    """
     if not events:
-        logger.debug(
-            "skip write request file: empty events",
-            extra={"session_id": session_id, "seq": seq},
-        )
         return "empty"
 
-    file_path = _build_request_file_path(dest_dir, session_id, seq)
+    file_path = _build_session_file_path(dest_dir, session_id)
     ensure_dir(str(file_path.parent))
-    if file_path.exists():
-        logger.debug(
-            "skip write request file: target exists",
-            extra={"session_id": session_id, "seq": seq, "path": str(file_path)},
-        )
-        return "exists"
-
-    tmp_path = file_path.with_name(
-        f".{file_path.name}.{os.getpid()}.{time.time_ns()}.tmp"
-    )
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            for event in events:
-                f.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
-                f.write("\n")
-
-        if file_path.exists():
-            try:
-                os.unlink(tmp_path)
-            except FileNotFoundError:
-                pass
-            logger.debug(
-                "skip replace request file: target exists after temp write",
-                extra={"session_id": session_id, "seq": seq, "path": str(file_path)},
-            )
-            return "exists"
-
-        os.replace(tmp_path, file_path)
-        logger.debug(
-            "write request file success",
-            extra={"session_id": session_id, "seq": seq, "path": str(file_path)},
-        )
-        return "written"
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except FileNotFoundError:
-            pass
-        raise
+    with open(file_path, "a", encoding="utf-8") as f:
+        for event in events:
+            f.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
+            f.write("\n")
+    return "appended"
 
 
 def _get_state_entry(state: dict, session_id: str) -> dict:
@@ -323,7 +279,7 @@ def process_session(
             events.extend(_extract_message_events(raw_messages, seq))
         if response_ready:
             events.extend(_extract_response_events(raw_response, seq))
-        write_request_events_atomic(dest_dir, session_id, seq, events)
+        append_session_events(dest_dir, session_id, events)
 
         if not messages_ready:
             _clear_missing(entry, "msg", seq)

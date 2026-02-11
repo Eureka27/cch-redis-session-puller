@@ -1,6 +1,6 @@
 # cch-redis-session-puller
 
-Incrementally reads `session:*` keys from Redis and writes JSONL shards.
+Incrementally reads `session:*` keys from Redis and appends JSONL events per session.
 
 ## Prerequisite
 
@@ -22,13 +22,9 @@ Important: `session_dir` in `cch-local-pull` server must point to this project's
 
 ## Output format
 
-- Directory per session:
-  - `DEST_DIR/<session_id>/`
-- One immutable file per request:
-  - `req-000001.json`
-  - `req-000002.json`
-- Each file is JSONL and uses the same event schema as the original session file.
-- Writes are atomic (`.tmp` + rename) and idempotent (existing shard is skipped).
+- One append-only file per session:
+  - `DEST_DIR/<session_id>.json`
+- File content is JSONL, using the same event schema as before.
 
 ## Install
 
