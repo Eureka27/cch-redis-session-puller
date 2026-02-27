@@ -26,6 +26,14 @@ Important: `session_dir` in `cch-local-pull` server must point to this project's
   - `DEST_DIR/<session_id>.json`
 - File content is JSONL, using the same event schema as before.
 
+## One-click Deploy
+
+Edit config at the top of `deploy/deploy-oneclick.sh`, then run:
+
+```bash
+bash deploy/deploy-oneclick.sh
+```
+
 ## Install
 
 ```bash
