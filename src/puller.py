@@ -20,6 +20,7 @@ from session_events import (
 
 
 STATE_VERSION = 1
+META_RETRY_SECONDS = 30
 logger = logging.getLogger(__name__)
 
 
@@ -211,6 +212,57 @@ def _extract_response_events(raw_response, seq: int) -> list[dict]:
     return events
 
 
+def _decode_redis_text(value) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except Exception:
+            return None
+    if isinstance(value, str):
+        return value
+    try:
+        return str(value)
+    except Exception:
+        return None
+
+
+def _read_session_info(r: redis.Redis, session_id: str) -> dict[str, str]:
+    info_key = f"session:{session_id}:info"
+    fields = ("userName", "keyId", "keyName", "model", "apiType")
+    try:
+        raw_values = r.hmget(info_key, fields)
+    except Exception:
+        return {}
+    if not isinstance(raw_values, list) or not raw_values:
+        return {}
+
+    info: dict[str, str] = {}
+    for key, raw_value in zip(fields, raw_values):
+        value = _decode_redis_text(raw_value)
+        if value is None:
+            continue
+        value = value.strip()
+        if not value:
+            continue
+        info[key] = value
+    return info
+
+
+def _build_session_meta_payload(info: dict[str, str]) -> dict:
+    user_name = info.get("userName", "").strip()
+    if not user_name:
+        return {}
+
+    payload: dict[str, str] = {"userName": user_name}
+    for field in ("keyId", "keyName", "model", "apiType"):
+        value = info.get(field, "").strip()
+        if value:
+            payload[field] = value
+    return payload
+
+
 def _read_seq_payloads(
     r: redis.Redis, session_id: str, seq: int
 ) -> tuple[bytes | str | None, bytes | str | None]:
@@ -244,6 +296,23 @@ def process_session(
         max_seq = int(seq_value)
     except Exception:
         return
+
+    if not entry.get("meta_written"):
+        retry_at = entry.get("meta_retry_at")
+        should_try_meta = True
+        if isinstance(retry_at, (int, float)) and now_ts < retry_at:
+            should_try_meta = False
+
+        if should_try_meta:
+            session_info = _read_session_info(r, session_id)
+            session_meta_payload = _build_session_meta_payload(session_info)
+            if session_meta_payload:
+                meta_event = build_event("session_meta", session_meta_payload, None)
+                append_session_events(dest_dir, session_id, [meta_event])
+                entry["meta_written"] = True
+                entry.pop("meta_retry_at", None)
+            else:
+                entry["meta_retry_at"] = now_ts + META_RETRY_SECONDS
 
     if cursor_seq >= max_seq:
         entry["cursor_seq"] = cursor_seq

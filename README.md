@@ -25,6 +25,12 @@ Important: `session_dir` in `cch-local-pull` server must point to this project's
 - One append-only file per session:
   - `DEST_DIR/<session_id>.json`
 - File content is JSONL, using the same event schema as before.
+- One optional session-level metadata event is included when available:
+  - `type`: `session_meta`
+  - `requestSequence`: `null`
+  - `payload.userName`: from `session:{session_id}:info.userName`
+  - optional fields: `payload.keyId`, `payload.keyName`, `payload.model`, `payload.apiType`
+  - written at most once per session file
 
 ## One-click Deploy
 
@@ -50,6 +56,10 @@ pip install -r requirements.txt
 - `STATE_PATH` (default: `./state/state.json`)
 - `POLL_INTERVAL_SECONDS` (default: `60`)
 - `MISSING_SKIP_SECONDS` (default: `300`)
+
+Notes:
+
+- If `claude-code-hub` runs with `STORE_SESSION_MESSAGES=false` (default), message content in Redis request/response bodies is redacted as `[REDACTED]`. To collect full `user_input` / `llm_answer`, set `STORE_SESSION_MESSAGES=true` in `claude-code-hub`.
 
 Example:
 
