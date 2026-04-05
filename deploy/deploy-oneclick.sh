@@ -4,6 +4,9 @@ set -euo pipefail
 # ===================== User Config (edit here) =====================
 DEPLOY_USER="${SUDO_USER:-${USER:-puller}}"  # systemd User=
 EXPORT_ROOT="./export"
+CADDY_ENABLE="0"
+CADDY_SITE_DOMAIN="apidata.example.com"
+CADDY_CONFIG_PATH="/etc/caddy/Caddyfile"
 
 # Redis connection: prefer REDIS_URL if provided, otherwise REDIS_CONTAINER.
 REDIS_URL=""
@@ -84,6 +87,18 @@ validate_config() {
   if [[ -z "${DATABASE_URL}" && -z "${DSN}" ]]; then
     fail "DATABASE_URL and DSN cannot both be empty"
   fi
+
+  if [[ "${CADDY_ENABLE}" != "0" && "${CADDY_ENABLE}" != "1" ]]; then
+    fail "CADDY_ENABLE must be 0 or 1"
+  fi
+
+  if [[ "${CADDY_ENABLE}" == "1" ]]; then
+    [[ -n "${CADDY_SITE_DOMAIN}" ]] || fail "CADDY_SITE_DOMAIN cannot be empty when CADDY_ENABLE=1"
+    [[ -n "${CADDY_CONFIG_PATH}" ]] || fail "CADDY_CONFIG_PATH cannot be empty when CADDY_ENABLE=1"
+    if [[ "${CADDY_CONFIG_PATH}" != /* ]]; then
+      fail "CADDY_CONFIG_PATH must be an absolute path"
+    fi
+  fi
 }
 
 write_env_file() {
@@ -148,6 +163,27 @@ WantedBy=multi-user.target
 UNIT
 }
 
+write_caddy_config() {
+  local export_root_path
+  local tmp_caddy
+  export_root_path="$(resolve_path "${EXPORT_ROOT}")"
+  tmp_caddy="$(mktemp)"
+  trap 'rm -f "${tmp_caddy}"' RETURN
+
+  cat > "${tmp_caddy}" <<CADDY
+${CADDY_SITE_DOMAIN} {
+    encode zstd gzip
+    root * ${export_root_path}
+    file_server browse
+}
+CADDY
+
+  run_root mkdir -p "$(dirname -- "${CADDY_CONFIG_PATH}")"
+  run_root install -m 0644 "${tmp_caddy}" "${CADDY_CONFIG_PATH}"
+  run_root systemctl reload caddy
+  run_root systemctl --no-pager --full status caddy || true
+}
+
 install_services() {
   local tmp_redis_unit
   local tmp_db_unit
@@ -187,6 +223,11 @@ main() {
 
   log "installing systemd services for redis_puller and db_exporter"
   install_services
+
+  if [[ "${CADDY_ENABLE}" == "1" ]]; then
+    log "writing Caddy static site config"
+    write_caddy_config
+  fi
 
   log "done"
 }

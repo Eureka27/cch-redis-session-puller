@@ -1,0 +1,5 @@
+apidata.example.com {
+    encode zstd gzip
+    root * /path/to/cch-redis-session-puller/export
+    file_server browse
+}

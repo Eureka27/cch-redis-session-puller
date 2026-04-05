@@ -92,17 +92,39 @@ pip install -r requirements.txt
 - `cch-redis-session-puller.service`
 - `cch-db-exporter.service`
 
+It can also optionally write a Caddy site config and reload Caddy when `CADDY_ENABLE=1`.
+
 Before running it, review the configuration block at the top of the script and set at least:
 
 - Redis connection: `REDIS_URL` or `REDIS_CONTAINER`
 - Database connection: `DATABASE_URL` or `DSN`
 - Output root: `EXPORT_ROOT`
+- Optional public domain: `CADDY_ENABLE`, `CADDY_SITE_DOMAIN`, `CADDY_CONFIG_PATH`
 
 Run:
 
 ```bash
 bash deploy/deploy-oneclick.sh
 ```
+
+## Caddy Static Site
+
+Use Caddy to serve `EXPORT_ROOT` directly as a static site.
+
+A ready-to-use example is provided in `deploy/Caddyfile.example`.
+
+Example placeholder domain:
+
+- `apidata.example.com`
+
+If this machine is dedicated to the data site, you can install the example directly:
+
+```bash
+sudo cp deploy/Caddyfile.example /etc/caddy/Caddyfile
+sudo systemctl reload caddy
+```
+
+If Caddy already serves other sites on the host, merge the example into your existing Caddy config or write it to an imported site file instead of overwriting the main `Caddyfile`.
 
 ## Environment
 
@@ -128,9 +150,16 @@ DB exporter:
 - `DB_POLL_INTERVAL_SECONDS` default: `300`
 - `DB_BATCH_SIZE` default: `500`
 
+Optional Caddy deploy:
+
+- `CADDY_ENABLE` default: `0`
+- `CADDY_SITE_DOMAIN` example: `apidata.example.com`
+- `CADDY_CONFIG_PATH` default: `/etc/caddy/Caddyfile`
+
 Notes:
 
 - If `claude-code-hub` runs with `STORE_SESSION_MESSAGES=false` (default), Redis request and response content is redacted as `[REDACTED]`. To export full `user_input` and `llm_answer`, set `STORE_SESSION_MESSAGES=true` in `claude-code-hub`.
+- The example Caddy config intentionally exposes exported files publicly. Add your own access controls if you do not want a public data site.
 
 Example:
 
