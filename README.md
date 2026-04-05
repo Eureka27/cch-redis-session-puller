@@ -1,18 +1,20 @@
 # cch-redis-session-puller
 
-Phase 1 地基版导出器，分成两个入口：
+`cch-redis-session-puller` exports existing data produced by `claude-code-hub` through two entrypoints:
 
-- `redis_puller`：增量读取 Redis `session:*` 数据，按 session 追加导出事件与 sidecar。
-- `db_exporter`：增量读取 PostgreSQL 中的 `message_request` 与 `usage_ledger`，按天导出 JSONL。
+- `redis_puller`: incrementally reads Redis `session:*` keys and appends per-session JSONL event files.
+- `db_exporter`: incrementally reads PostgreSQL tables and writes daily JSONL partitions.
+
+For a complete dataset, deploy both entrypoints together.
 
 ## Prerequisite
 
 Deploy `claude-code-hub` first:  
 `https://github.com/ding113/claude-code-hub`
 
-本项目读取 `claude-code-hub` 已有存量数据，不新增原始埋点。
+This project exports data that already exists in Redis and PostgreSQL. It does not add new instrumentation.
 
-## Optional: low-storage source server setup
+## Optional: Low-Storage Source Server Setup
 
 If the source server has limited disk space:
 
@@ -21,30 +23,59 @@ If the source server has limited disk space:
 - Deploy `cch-local-pull` client on a data server:  
   `https://github.com/Eureka27/cch-local-pull`
 
-Important: `session_dir` in `cch-local-pull` server must point to this project's `DEST_DIR`.
+Important: `session_dir` in the `cch-local-pull` server must point to this project's `DEST_DIR`.
 
-## Output
+## What Each Entrypoint Collects
 
-Redis puller:
+### Redis puller
+
+Files:
 
 - `DEST_DIR/<session_id>.json`
-  - 追加写入 `session_meta`、`user_input`、`tool_io`、`llm_answer`
 - `REDIS_SIDECARS_DIR/<session_id>.json`
-  - 追加写入 `session_info`、`session_usage`
-  - 以及每个 request sequence 的 `request_body`、`request_special_settings`
-  - `client_request_meta`、`upstream_request_meta`、`upstream_response_meta`
-  - `request_headers`、`response_headers`、`response_body`
 
-DB exporter:
+Primary session event output:
+
+- `session_meta`
+- `user_input`
+- `tool_io`
+- `llm_answer`
+
+Sidecar output:
+
+- `session_info`
+- `session_usage`
+- `request_body`
+- `request_special_settings`
+- `client_request_meta`
+- `upstream_request_meta`
+- `upstream_response_meta`
+- `request_headers`
+- `response_headers`
+- `response_body`
+
+### DB exporter
+
+Files:
 
 - `DB_EXPORT_DIR/message_request/YYYY-MM-DD.jsonl`
 - `DB_EXPORT_DIR/usage_ledger/YYYY-MM-DD.jsonl`
-- state 文件默认落在 `EXPORT_ROOT/state/`
 
-要得到 Phase 1 的完整地基数据，生产环境应同时部署 `redis_puller` 和 `db_exporter`：
+Tables:
 
-- Redis puller 提供会话级事件、sidecar 和瞬时上下文。
-- DB exporter 提供结构化请求记录和计费流水。
+- `message_request`
+- `usage_ledger`
+
+State files are stored under `EXPORT_ROOT/state/` by default.
+
+## Deployment Recommendation
+
+Deploy both services in production:
+
+- `redis_puller` provides session-level events, sidecars, and transient request/response context.
+- `db_exporter` provides structured request records and usage ledger data.
+
+Running only one of them gives you only part of the dataset.
 
 ## Install
 
@@ -54,20 +85,20 @@ python3 -m venv .venv
 pip install -r requirements.txt
 ```
 
-## One-click Deploy
+## One-Click Deploy
 
-`deploy/deploy-oneclick.sh` 会同时部署两个 systemd 服务：
+`deploy/deploy-oneclick.sh` installs and starts both systemd services:
 
 - `cch-redis-session-puller.service`
 - `cch-db-exporter.service`
 
-运行前请先编辑脚本顶部配置，至少确认：
+Before running it, review the configuration block at the top of the script and set at least:
 
-- Redis 配置：`REDIS_URL` 或 `REDIS_CONTAINER`
-- DB 配置：`DATABASE_URL` 或 `DSN`
-- 导出目录：`EXPORT_ROOT`
+- Redis connection: `REDIS_URL` or `REDIS_CONTAINER`
+- Database connection: `DATABASE_URL` or `DSN`
+- Output root: `EXPORT_ROOT`
 
-执行：
+Run:
 
 ```bash
 bash deploy/deploy-oneclick.sh
@@ -77,29 +108,29 @@ bash deploy/deploy-oneclick.sh
 
 Common:
 
-- `EXPORT_ROOT` (default: `./export`)
+- `EXPORT_ROOT` default: `./export`
 
 Redis puller:
 
-- `REDIS_URL` (optional if `REDIS_CONTAINER` is set)
-- `REDIS_CONTAINER` (default: `claude-code-hub-redis`)
-- `DEST_DIR` (default: `./export/redis/session_events`)
-- `REDIS_SIDECARS_DIR` (default: `./export/redis/request_sidecars`)
-- `STATE_PATH` (default: `./export/state/redis_puller.json`)
-- `POLL_INTERVAL_SECONDS` (default: `60`)
-- `MISSING_SKIP_SECONDS` (default: `300`)
+- `REDIS_URL` optional if `REDIS_CONTAINER` is set
+- `REDIS_CONTAINER` default: `claude-code-hub-redis`
+- `DEST_DIR` default: `./export/redis/session_events`
+- `REDIS_SIDECARS_DIR` default: `./export/redis/request_sidecars`
+- `STATE_PATH` default: `./export/state/redis_puller.json`
+- `POLL_INTERVAL_SECONDS` default: `60`
+- `MISSING_SKIP_SECONDS` default: `300`
 
 DB exporter:
 
 - `DATABASE_URL` or `DSN`
-- `DB_EXPORT_DIR` (default: `./export/db`)
-- `DB_STATE_PATH` (default: `./export/state/db_exporter.json`)
-- `DB_POLL_INTERVAL_SECONDS` (default: `300`)
-- `DB_BATCH_SIZE` (default: `500`)
+- `DB_EXPORT_DIR` default: `./export/db`
+- `DB_STATE_PATH` default: `./export/state/db_exporter.json`
+- `DB_POLL_INTERVAL_SECONDS` default: `300`
+- `DB_BATCH_SIZE` default: `500`
 
 Notes:
 
-- If `claude-code-hub` runs with `STORE_SESSION_MESSAGES=false` (default), message content in Redis request/response bodies is redacted as `[REDACTED]`. To collect full `user_input` / `llm_answer`, set `STORE_SESSION_MESSAGES=true` in `claude-code-hub`.
+- If `claude-code-hub` runs with `STORE_SESSION_MESSAGES=false` (default), Redis request and response content is redacted as `[REDACTED]`. To export full `user_input` and `llm_answer`, set `STORE_SESSION_MESSAGES=true` in `claude-code-hub`.
 
 Example:
 
@@ -109,7 +140,7 @@ cp deploy/cch-redis-session-puller.env.example .env.local
 
 ## Run
 
-建议同时运行两个入口：
+Recommended: run both entrypoints.
 
 ```bash
 deploy/run-puller.sh
