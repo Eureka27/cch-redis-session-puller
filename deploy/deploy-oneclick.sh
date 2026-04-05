@@ -2,22 +2,33 @@
 set -euo pipefail
 
 # ===================== User Config (edit here) =====================
-DEPLOY_USER="ubuntu"  # systemd User=
+DEPLOY_USER="${SUDO_USER:-${USER:-puller}}"  # systemd User=
+EXPORT_ROOT="./export"
 
 # Redis connection: prefer REDIS_URL if provided, otherwise REDIS_CONTAINER.
 REDIS_URL=""
 REDIS_CONTAINER="claude-code-hub-redis"
-
-DEST_DIR="./session"
-STATE_PATH="./state/state.json"
+DEST_DIR="./export/redis/session_events"
+REDIS_SIDECARS_DIR="./export/redis/request_sidecars"
+STATE_PATH="./export/state/redis_puller.json"
 POLL_INTERVAL_SECONDS="60"
 MISSING_SKIP_SECONDS="300"
+
+# DB connection: set DATABASE_URL or DSN.
+DATABASE_URL=""
+DSN=""
+DB_EXPORT_DIR="./export/db"
+DB_STATE_PATH="./export/state/db_exporter.json"
+DB_POLL_INTERVAL_SECONDS="300"
+DB_BATCH_SIZE="500"
 # ================================================================
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
-SERVICE_NAME="cch-redis-session-puller.service"
-SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}"
+REDIS_SERVICE_NAME="cch-redis-session-puller.service"
+DB_SERVICE_NAME="cch-db-exporter.service"
+REDIS_SERVICE_PATH="/etc/systemd/system/${REDIS_SERVICE_NAME}"
+DB_SERVICE_PATH="/etc/systemd/system/${DB_SERVICE_NAME}"
 SYSTEM_ENV_PATH="/etc/cch-redis-session-puller.env"
 LOCAL_ENV_PATH="${REPO_ROOT}/.env.local"
 
@@ -55,26 +66,50 @@ resolve_path() {
 
 validate_config() {
   [[ -n "${DEPLOY_USER}" ]] || fail "DEPLOY_USER cannot be empty"
+  [[ -n "${EXPORT_ROOT}" ]] || fail "EXPORT_ROOT cannot be empty"
   [[ -n "${DEST_DIR}" ]] || fail "DEST_DIR cannot be empty"
+  [[ -n "${REDIS_SIDECARS_DIR}" ]] || fail "REDIS_SIDECARS_DIR cannot be empty"
   [[ -n "${STATE_PATH}" ]] || fail "STATE_PATH cannot be empty"
   [[ -n "${POLL_INTERVAL_SECONDS}" ]] || fail "POLL_INTERVAL_SECONDS cannot be empty"
   [[ -n "${MISSING_SKIP_SECONDS}" ]] || fail "MISSING_SKIP_SECONDS cannot be empty"
+  [[ -n "${DB_EXPORT_DIR}" ]] || fail "DB_EXPORT_DIR cannot be empty"
+  [[ -n "${DB_STATE_PATH}" ]] || fail "DB_STATE_PATH cannot be empty"
+  [[ -n "${DB_POLL_INTERVAL_SECONDS}" ]] || fail "DB_POLL_INTERVAL_SECONDS cannot be empty"
+  [[ -n "${DB_BATCH_SIZE}" ]] || fail "DB_BATCH_SIZE cannot be empty"
 
   if [[ -z "${REDIS_URL}" && -z "${REDIS_CONTAINER}" ]]; then
     fail "REDIS_URL and REDIS_CONTAINER cannot both be empty"
   fi
+
+  if [[ -z "${DATABASE_URL}" && -z "${DSN}" ]]; then
+    fail "DATABASE_URL and DSN cannot both be empty"
+  fi
 }
 
 write_env_file() {
-  mkdir -p "$(dirname -- "$(resolve_path "${DEST_DIR}")")" "$(dirname -- "$(resolve_path "${STATE_PATH}")")"
+  mkdir -p \
+    "$(resolve_path "${EXPORT_ROOT}")" \
+    "$(resolve_path "${DEST_DIR}")" \
+    "$(resolve_path "${REDIS_SIDECARS_DIR}")" \
+    "$(dirname -- "$(resolve_path "${STATE_PATH}")")" \
+    "$(resolve_path "${DB_EXPORT_DIR}")" \
+    "$(dirname -- "$(resolve_path "${DB_STATE_PATH}")")"
 
   cat > "${LOCAL_ENV_PATH}" <<ENV
+EXPORT_ROOT=${EXPORT_ROOT}
 REDIS_CONTAINER=${REDIS_CONTAINER}
 REDIS_URL=${REDIS_URL}
 DEST_DIR=${DEST_DIR}
+REDIS_SIDECARS_DIR=${REDIS_SIDECARS_DIR}
 STATE_PATH=${STATE_PATH}
 POLL_INTERVAL_SECONDS=${POLL_INTERVAL_SECONDS}
 MISSING_SKIP_SECONDS=${MISSING_SKIP_SECONDS}
+DATABASE_URL=${DATABASE_URL}
+DSN=${DSN}
+DB_EXPORT_DIR=${DB_EXPORT_DIR}
+DB_STATE_PATH=${DB_STATE_PATH}
+DB_POLL_INTERVAL_SECONDS=${DB_POLL_INTERVAL_SECONDS}
+DB_BATCH_SIZE=${DB_BATCH_SIZE}
 ENV
 
   run_root install -m 0644 "${LOCAL_ENV_PATH}" "${SYSTEM_ENV_PATH}"
@@ -89,14 +124,14 @@ prepare_python() {
   "${REPO_ROOT}/.venv/bin/pip" install -r "${REPO_ROOT}/requirements.txt"
 }
 
-install_service() {
-  local tmp_unit
-  tmp_unit="$(mktemp)"
-  trap 'rm -f "${tmp_unit}"' RETURN
+write_service_unit() {
+  local path="$1"
+  local description="$2"
+  local exec_start="$3"
 
-  cat > "${tmp_unit}" <<UNIT
+  cat > "${path}" <<UNIT
 [Unit]
-Description=CCH Redis Session Puller
+Description=${description}
 After=network.target
 
 [Service]
@@ -104,19 +139,39 @@ Type=simple
 User=${DEPLOY_USER}
 EnvironmentFile=${SYSTEM_ENV_PATH}
 WorkingDirectory=${REPO_ROOT}
-ExecStart=${REPO_ROOT}/deploy/run-puller.sh
+ExecStart=${exec_start}
 Restart=always
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 UNIT
+}
 
-  run_root install -m 0644 "${tmp_unit}" "${SERVICE_PATH}"
+install_services() {
+  local tmp_redis_unit
+  local tmp_db_unit
+  tmp_redis_unit="$(mktemp)"
+  tmp_db_unit="$(mktemp)"
+  trap 'rm -f "${tmp_redis_unit}" "${tmp_db_unit}"' RETURN
+
+  write_service_unit \
+    "${tmp_redis_unit}" \
+    "CCH Redis Session Puller" \
+    "${REPO_ROOT}/deploy/run-puller.sh"
+  write_service_unit \
+    "${tmp_db_unit}" \
+    "CCH DB Exporter" \
+    "${REPO_ROOT}/deploy/run-db-exporter.sh"
+
+  run_root install -m 0644 "${tmp_redis_unit}" "${REDIS_SERVICE_PATH}"
+  run_root install -m 0644 "${tmp_db_unit}" "${DB_SERVICE_PATH}"
   run_root chmod +x "${REPO_ROOT}/deploy/run-puller.sh"
+  run_root chmod +x "${REPO_ROOT}/deploy/run-db-exporter.sh"
   run_root systemctl daemon-reload
-  run_root systemctl enable --now "${SERVICE_NAME}"
-  run_root systemctl --no-pager --full status "${SERVICE_NAME}" || true
+  run_root systemctl enable --now "${REDIS_SERVICE_NAME}" "${DB_SERVICE_NAME}"
+  run_root systemctl --no-pager --full status "${REDIS_SERVICE_NAME}" || true
+  run_root systemctl --no-pager --full status "${DB_SERVICE_NAME}" || true
 }
 
 main() {
@@ -124,18 +179,14 @@ main() {
   require_cmd python3
   require_cmd systemctl
 
-  if [[ -z "${REDIS_URL}" ]]; then
-    require_cmd docker
-  fi
-
   log "preparing python virtualenv and dependencies"
   prepare_python
 
   log "writing environment files"
   write_env_file
 
-  log "installing systemd service"
-  install_service
+  log "installing systemd services for redis_puller and db_exporter"
+  install_services
 
   log "done"
 }

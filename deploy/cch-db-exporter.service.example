@@ -1,0 +1,14 @@
+[Unit]
+Description=CCH DB Exporter
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/cch-redis-session-puller.env
+WorkingDirectory=/path/to/cch-redis-session-puller
+ExecStart=/path/to/cch-redis-session-puller/deploy/run-db-exporter.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

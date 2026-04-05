@@ -1,72 +1,46 @@
 """Usage: python3 src/puller.py [--once]"""
 
+from __future__ import annotations
+
 import argparse
 import json
 import logging
-import os
 import time
-from pathlib import Path
 
 import redis
 
-from config import load_config
+from config import load_redis_config
+from export_state import STATE_VERSION, load_state, save_state
+from output_writer import (
+    append_jsonl,
+    build_session_file_path,
+    normalize_json_value,
+)
 from session_events import (
     build_event,
     extract_llm_artifacts_from_response_text,
     extract_session_events_from_messages,
-    sanitize_path_segment,
     tool_input_to_text,
 )
 
 
-STATE_VERSION = 1
 META_RETRY_SECONDS = 30
+SNAPSHOT_KEYS = ("last_info_signature", "last_usage_signature")
+STATE_DEFAULT = {"version": STATE_VERSION, "sessions": {}}
 logger = logging.getLogger(__name__)
 
 
-def load_state(path: str) -> dict:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if isinstance(data, dict):
-                if data.get("version") != STATE_VERSION:
-                    return {"version": STATE_VERSION, "sessions": {}}
-                return data
-    except FileNotFoundError:
-        pass
-    except Exception:
-        pass
-    return {"version": STATE_VERSION, "sessions": {}}
-
-
-def save_state(path: str, state: dict) -> None:
-    tmp_path = f"{path}.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, separators=(",", ":"))
-    os.replace(tmp_path, path)
-
-
-def ensure_dir(path: str) -> None:
-    Path(path).mkdir(parents=True, exist_ok=True)
-
-
-def _build_session_file_path(dest_dir: str, session_id: str) -> Path:
-    safe_id = sanitize_path_segment(session_id)
-    return Path(dest_dir) / f"{safe_id}.json"
-
-
-def append_session_events(
-    dest_dir: str, session_id: str, events: list[dict]
-) -> str:
+def append_session_events(dest_dir: str, session_id: str, events: list[dict]) -> str:
     if not events:
         return "empty"
+    append_jsonl(build_session_file_path(dest_dir, session_id), events)
+    return "appended"
 
-    file_path = _build_session_file_path(dest_dir, session_id)
-    ensure_dir(str(file_path.parent))
-    with open(file_path, "a", encoding="utf-8") as f:
-        for event in events:
-            f.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
-            f.write("\n")
+
+def append_session_sidecars(sidecar_dir: str, session_id: str, events: list[dict]) -> str:
+    if not events:
+        return "empty"
+    append_jsonl(build_session_file_path(sidecar_dir, session_id), events)
     return "appended"
 
 
@@ -160,6 +134,81 @@ def _get_cursor_seq(entry: dict) -> int:
     return max(last_msg_seq, last_rsp_seq)
 
 
+def _decode_redis_text(value) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except Exception:
+            return None
+    if isinstance(value, str):
+        return value
+    try:
+        return str(value)
+    except Exception:
+        return None
+
+
+def _decode_redis_hash(raw_hash) -> dict[str, str]:
+    if not isinstance(raw_hash, dict):
+        return {}
+
+    decoded: dict[str, str] = {}
+    for raw_key, raw_value in raw_hash.items():
+        key = _decode_redis_text(raw_key)
+        value = _decode_redis_text(raw_value)
+        if key is None or value is None:
+            continue
+        decoded[key] = value
+    return decoded
+
+
+def _read_hash(r: redis.Redis, key: str) -> dict[str, str]:
+    try:
+        return _decode_redis_hash(r.hgetall(key))
+    except Exception:
+        return {}
+
+
+def _stable_signature(payload: dict[str, str]) -> str:
+    return json.dumps(normalize_json_value(payload), ensure_ascii=False, sort_keys=True)
+
+
+def _build_session_meta_payload(info: dict[str, str]) -> dict:
+    user_name = info.get("userName", "").strip()
+    if not user_name:
+        return {}
+
+    payload: dict[str, str] = {"userName": user_name}
+    for field in ("keyId", "keyName", "model", "apiType"):
+        value = info.get(field, "").strip()
+        if value:
+            payload[field] = value
+    return payload
+
+
+def _append_session_snapshot(
+    sidecar_dir: str,
+    session_id: str,
+    entry: dict,
+    state_key: str,
+    event_type: str,
+    payload: dict[str, str],
+) -> None:
+    if not payload:
+        return
+    signature = _stable_signature(payload)
+    if entry.get(state_key) == signature:
+        return
+    append_session_sidecars(
+        sidecar_dir,
+        session_id,
+        [build_event(event_type, payload, None)],
+    )
+    entry[state_key] = signature
+
+
 def _extract_message_events(raw_messages, seq: int) -> list[dict]:
     try:
         messages = json.loads(raw_messages)
@@ -175,15 +224,7 @@ def _extract_message_events(raw_messages, seq: int) -> list[dict]:
 
 
 def _extract_response_events(raw_response, seq: int) -> list[dict]:
-    try:
-        response_text = (
-            raw_response.decode("utf-8")
-            if isinstance(raw_response, bytes)
-            else str(raw_response)
-        )
-    except Exception:
-        return []
-
+    response_text = _decode_redis_text(raw_response)
     if not response_text:
         return []
 
@@ -212,69 +253,78 @@ def _extract_response_events(raw_response, seq: int) -> list[dict]:
     return events
 
 
-def _decode_redis_text(value) -> str | None:
-    if value is None:
-        return None
-    if isinstance(value, bytes):
-        try:
-            return value.decode("utf-8")
-        except Exception:
-            return None
-    if isinstance(value, str):
-        return value
+def _read_seq_records(r: redis.Redis, session_id: str, seq: int) -> dict[str, bytes | str | None]:
+    keys = {
+        "messages": f"session:{session_id}:req:{seq}:messages",
+        "response": f"session:{session_id}:req:{seq}:response",
+        "request_body": f"session:{session_id}:req:{seq}:requestBody",
+        "special_settings": f"session:{session_id}:req:{seq}:specialSettings",
+        "client_request_meta": f"session:{session_id}:req:{seq}:clientReqMeta",
+        "upstream_request_meta": f"session:{session_id}:req:{seq}:upstreamReqMeta",
+        "upstream_response_meta": f"session:{session_id}:req:{seq}:upstreamResMeta",
+        "request_headers": f"session:{session_id}:req:{seq}:reqHeaders",
+        "response_headers": f"session:{session_id}:req:{seq}:resHeaders",
+    }
     try:
-        return str(value)
-    except Exception:
-        return None
-
-
-def _read_session_info(r: redis.Redis, session_id: str) -> dict[str, str]:
-    info_key = f"session:{session_id}:info"
-    fields = ("userName", "keyId", "keyName", "model", "apiType")
-    try:
-        raw_values = r.hmget(info_key, fields)
-    except Exception:
-        return {}
-    if not isinstance(raw_values, list) or not raw_values:
-        return {}
-
-    info: dict[str, str] = {}
-    for key, raw_value in zip(fields, raw_values):
-        value = _decode_redis_text(raw_value)
-        if value is None:
-            continue
-        value = value.strip()
-        if not value:
-            continue
-        info[key] = value
-    return info
-
-
-def _build_session_meta_payload(info: dict[str, str]) -> dict:
-    user_name = info.get("userName", "").strip()
-    if not user_name:
-        return {}
-
-    payload: dict[str, str] = {"userName": user_name}
-    for field in ("keyId", "keyName", "model", "apiType"):
-        value = info.get(field, "").strip()
-        if value:
-            payload[field] = value
-    return payload
-
-
-def _read_seq_payloads(
-    r: redis.Redis, session_id: str, seq: int
-) -> tuple[bytes | str | None, bytes | str | None]:
-    msg_key = f"session:{session_id}:req:{seq}:messages"
-    rsp_key = f"session:{session_id}:req:{seq}:response"
-    try:
-        values = r.mget([msg_key, rsp_key])
-        if isinstance(values, list) and len(values) == 2:
-            return values[0], values[1]
+        values = r.mget(list(keys.values()))
+        if isinstance(values, list) and len(values) == len(keys):
+            return {
+                name: values[index]
+                for index, name in enumerate(keys.keys())
+            }
     except Exception:
         pass
-    return r.get(msg_key), r.get(rsp_key)
+    return {name: r.get(key) for name, key in keys.items()}
+
+
+def _parse_json_value(raw_value):
+    text = _decode_redis_text(raw_value)
+    if text is None:
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        return text
+
+
+def _extract_sidecar_events(records: dict[str, bytes | str | None], seq: int) -> list[dict]:
+    events: list[dict] = []
+
+    request_body = _parse_json_value(records.get("request_body"))
+    if request_body is not None:
+        events.append(build_event("request_body", {"body": request_body}, seq))
+
+    special_settings = _parse_json_value(records.get("special_settings"))
+    if special_settings is not None:
+        events.append(
+            build_event("request_special_settings", {"items": special_settings}, seq)
+        )
+
+    client_request_meta = _parse_json_value(records.get("client_request_meta"))
+    if isinstance(client_request_meta, dict):
+        events.append(build_event("client_request_meta", client_request_meta, seq))
+
+    upstream_request_meta = _parse_json_value(records.get("upstream_request_meta"))
+    if isinstance(upstream_request_meta, dict):
+        events.append(build_event("upstream_request_meta", upstream_request_meta, seq))
+
+    upstream_response_meta = _parse_json_value(records.get("upstream_response_meta"))
+    if isinstance(upstream_response_meta, dict):
+        events.append(build_event("upstream_response_meta", upstream_response_meta, seq))
+
+    request_headers = _parse_json_value(records.get("request_headers"))
+    if isinstance(request_headers, dict):
+        events.append(build_event("request_headers", {"headers": request_headers}, seq))
+
+    response_headers = _parse_json_value(records.get("response_headers"))
+    if isinstance(response_headers, dict):
+        events.append(build_event("response_headers", {"headers": response_headers}, seq))
+
+    response_body = _decode_redis_text(records.get("response"))
+    if response_body:
+        events.append(build_event("response_body", {"text": response_body}, seq))
+
+    return events
 
 
 def process_session(
@@ -282,12 +332,22 @@ def process_session(
     state: dict,
     session_id: str,
     dest_dir: str,
+    sidecar_dir: str,
     now_ts: float,
     skip_seconds: int,
 ) -> None:
     entry = _get_state_entry(state, session_id)
     cursor_seq = _get_cursor_seq(entry)
     _prune_missing(entry, cursor_seq, now_ts, skip_seconds)
+
+    session_info = _read_hash(r, f"session:{session_id}:info")
+    session_usage = _read_hash(r, f"session:{session_id}:usage")
+    _append_session_snapshot(
+        sidecar_dir, session_id, entry, "last_info_signature", "session_info", session_info
+    )
+    _append_session_snapshot(
+        sidecar_dir, session_id, entry, "last_usage_signature", "session_usage", session_usage
+    )
 
     seq_value = r.get(f"session:{session_id}:seq")
     if not seq_value:
@@ -304,11 +364,13 @@ def process_session(
             should_try_meta = False
 
         if should_try_meta:
-            session_info = _read_session_info(r, session_id)
             session_meta_payload = _build_session_meta_payload(session_info)
             if session_meta_payload:
-                meta_event = build_event("session_meta", session_meta_payload, None)
-                append_session_events(dest_dir, session_id, [meta_event])
+                append_session_events(
+                    dest_dir,
+                    session_id,
+                    [build_event("session_meta", session_meta_payload, None)],
+                )
                 entry["meta_written"] = True
                 entry.pop("meta_retry_at", None)
             else:
@@ -321,7 +383,9 @@ def process_session(
         return
 
     for seq in range(cursor_seq + 1, max_seq + 1):
-        raw_messages, raw_response = _read_seq_payloads(r, session_id, seq)
+        records = _read_seq_records(r, session_id, seq)
+        raw_messages = records.get("messages")
+        raw_response = records.get("response")
 
         messages_ready = raw_messages is not None
         response_ready = raw_response is not None
@@ -344,11 +408,14 @@ def process_session(
             break
 
         events: list[dict] = []
+        sidecars: list[dict] = []
         if messages_ready:
             events.extend(_extract_message_events(raw_messages, seq))
         if response_ready:
             events.extend(_extract_response_events(raw_response, seq))
+        sidecars.extend(_extract_sidecar_events(records, seq))
         append_session_events(dest_dir, session_id, events)
+        append_session_sidecars(sidecar_dir, session_id, sidecars)
 
         if not messages_ready:
             _clear_missing(entry, "msg", seq)
@@ -371,12 +438,11 @@ def scan_sessions(r: redis.Redis) -> list[str]:
         cursor, keys = r.scan(cursor=cursor, match=pattern, count=1000)
         if keys:
             for key in keys:
-                if isinstance(key, bytes):
-                    key = key.decode("utf-8")
-                if not isinstance(key, str):
+                decoded = _decode_redis_text(key)
+                if not decoded:
                     continue
-                if key.startswith("session:") and key.endswith(":info"):
-                    session_id = key[len("session:") : -len(":info")]
+                if decoded.startswith("session:") and decoded.endswith(":info"):
+                    session_id = decoded[len("session:") : -len(":info")]
                     if session_id:
                         session_ids.append(session_id)
         if cursor == 0:
@@ -386,9 +452,7 @@ def scan_sessions(r: redis.Redis) -> list[str]:
 
 def run_once(config: dict) -> None:
     r = redis.Redis.from_url(config["redis_url"], decode_responses=False)
-    ensure_dir(config["dest_dir"])
-    ensure_dir(str(Path(config["state_path"]).parent))
-    state = load_state(config["state_path"])
+    state = load_state(config["state_path"], STATE_DEFAULT)
 
     now_ts = time.time()
     session_ids = scan_sessions(r)
@@ -398,6 +462,7 @@ def run_once(config: dict) -> None:
             state,
             session_id,
             config["dest_dir"],
+            config["sidecar_dir"],
             now_ts,
             config["missing_skip_seconds"],
         )
@@ -410,7 +475,7 @@ def main() -> None:
     parser.add_argument("--once", action="store_true", help="run once and exit")
     args = parser.parse_args()
 
-    config = load_config()
+    config = load_redis_config()
 
     if args.once:
         run_once(config)

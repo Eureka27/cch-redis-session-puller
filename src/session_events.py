@@ -94,7 +94,8 @@ def extract_session_events_from_messages(messages) -> list[dict]:
     if not isinstance(messages, list):
         return []
 
-    events: list[dict] = []
+    last_user_texts: list[str] = []
+    tool_output_events: list[dict] = []
     for message in messages:
         if not isinstance(message, dict):
             continue
@@ -106,20 +107,18 @@ def extract_session_events_from_messages(messages) -> list[dict]:
             if text and text.strip():
                 extracted = extract_user_lines_from_conversation_text(text)
                 if extracted:
-                    for line in extracted:
-                        events.append({"type": "user_input", "payload": {"text": line}})
+                    last_user_texts = extracted
                 elif not should_ignore_user_text(text):
-                    events.append({"type": "user_input", "payload": {"text": text}})
+                    last_user_texts = [text]
 
         if message.get("type") == "input_text" and isinstance(message.get("text"), str):
             text = message["text"]
             if text.strip():
                 extracted = extract_user_lines_from_conversation_text(text)
                 if extracted:
-                    for line in extracted:
-                        events.append({"type": "user_input", "payload": {"text": line}})
+                    last_user_texts = extracted
                 elif not should_ignore_user_text(text):
-                    events.append({"type": "user_input", "payload": {"text": text}})
+                    last_user_texts = [text]
 
         if isinstance(content, list):
             for part in content:
@@ -128,7 +127,7 @@ def extract_session_events_from_messages(messages) -> list[dict]:
                 if part.get("type") == "tool_result":
                     text = _normalize_content_to_text(part.get("content"))
                     if text and text.strip():
-                        events.append({
+                        tool_output_events.append({
                             "type": "tool_io",
                             "payload": {"phase": "output", "text": text},
                         })
@@ -136,7 +135,7 @@ def extract_session_events_from_messages(messages) -> list[dict]:
         if message.get("role") == "tool":
             text = _normalize_content_to_text(message.get("content"))
             if text and text.strip():
-                events.append({
+                tool_output_events.append({
                     "type": "tool_io",
                     "payload": {"phase": "output", "text": text},
                 })
@@ -146,12 +145,17 @@ def extract_session_events_from_messages(messages) -> list[dict]:
                 message.get("output", message.get("content", message.get("result")))
             )
             if text and text.strip():
-                events.append({
+                tool_output_events.append({
                     "type": "tool_io",
                     "payload": {"phase": "output", "text": text},
                 })
 
-    return events
+    user_events = [
+        {"type": "user_input", "payload": {"text": text}}
+        for text in last_user_texts
+        if isinstance(text, str) and text.strip()
+    ]
+    return user_events + tool_output_events
 
 
 def is_sse_text(text: str) -> bool:
@@ -293,12 +297,16 @@ def _extract_from_response_api_object(
     for item in output:
         if not isinstance(item, dict):
             continue
-        if item.get("type") == "message" and isinstance(item.get("content"), list):
-            for part in item.get("content"):
-                if not isinstance(part, dict):
-                    continue
-                if part.get("type") in ("output_text", "text"):
-                    _append_text(text_parts, part.get("text"))
+        if item.get("type") == "message":
+            content = item.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    if part.get("type") in ("output_text", "text"):
+                        _append_text(text_parts, part.get("text"))
+            else:
+                _append_text(text_parts, _normalize_content_to_text(content))
         if item.get("type") == "output_text":
             _append_text(text_parts, item.get("text"))
         if item.get("type") == "function_call":
@@ -434,16 +442,33 @@ def _extract_from_openai_stream_events(
 def _extract_from_response_stream_events(
     events: list[dict], text_parts: list[str], tool_uses: list[dict]
 ):
+    final_response_obj: dict | None = None
+    for event in events:
+        data = event.get("data")
+        if not isinstance(data, dict):
+            continue
+        response_obj = data.get("response")
+        if isinstance(response_obj, dict):
+            final_response_obj = response_obj
+
+    if final_response_obj is not None:
+        before_len = len(text_parts)
+        _extract_from_response_api_object(final_response_obj, text_parts, tool_uses)
+        if len(text_parts) != before_len:
+            return
+
     for event in events:
         data = event.get("data")
         if not isinstance(data, dict):
             continue
         event_type = data.get("type") if isinstance(data.get("type"), str) else ""
-        if event_type == "response.output_text.delta":
-            delta = data.get("delta") if isinstance(data.get("delta"), dict) else None
-            if delta:
+        if event_type in {"response.output_text.delta", "response.output_text.done"}:
+            delta = data.get("delta")
+            if isinstance(delta, str):
+                _append_text(text_parts, delta)
+            elif isinstance(delta, dict):
                 _append_text(text_parts, delta.get("text"))
-        if event_type == "response.output_item.added":
+        if event_type in {"response.output_item.added", "response.output_item.done"}:
             item = data.get("item")
             if isinstance(item, dict):
                 _extract_from_response_api_object({"output": [item]}, text_parts, tool_uses)
@@ -458,8 +483,6 @@ def _extract_from_response_stream_events(
                 args = data["function"].get("arguments")
             if name or args is not None:
                 tool_uses.append({"name": name, "input": _parse_tool_input(args)})
-        if isinstance(data.get("response"), dict):
-            _extract_from_response_api_object(data.get("response"), text_parts, tool_uses)
 
 
 def _detect_sse_format(events: list[dict]) -> str | None:
