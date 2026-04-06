@@ -39,7 +39,7 @@ def load_redis_config() -> dict:
     return {
         **common,
         "redis_url": redis_url,
-        "poll_interval": _get_int_env("POLL_INTERVAL_SECONDS", 60),
+        "poll_interval": _get_int_env("POLL_INTERVAL_SECONDS", 30),
         "dest_dir": _get_env(
             "DEST_DIR",
             _build_default_path(common["export_root"], "redis", "session_events"),

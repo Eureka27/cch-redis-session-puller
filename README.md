@@ -139,7 +139,7 @@ Redis puller:
 - `DEST_DIR` default: `./export/redis/session_events`
 - `REDIS_SIDECARS_DIR` default: `./export/redis/request_sidecars`
 - `STATE_PATH` default: `./export/state/redis_puller.json`
-- `POLL_INTERVAL_SECONDS` default: `60`
+- `POLL_INTERVAL_SECONDS` default: `30`
 - `MISSING_SKIP_SECONDS` default: `300`
 
 DB exporter:

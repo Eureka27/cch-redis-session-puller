@@ -14,7 +14,7 @@ REDIS_CONTAINER="claude-code-hub-redis"
 DEST_DIR="./export/redis/session_events"
 REDIS_SIDECARS_DIR="./export/redis/request_sidecars"
 STATE_PATH="./export/state/redis_puller.json"
-POLL_INTERVAL_SECONDS="60"
+POLL_INTERVAL_SECONDS="30"
 MISSING_SKIP_SECONDS="300"
 
 # DB connection: set DATABASE_URL or DSN.
