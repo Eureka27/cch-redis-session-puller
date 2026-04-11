@@ -90,6 +90,256 @@ def _normalize_content_to_text(value) -> str | None:
     return _normalize_value_to_text(value)
 
 
+def _string_or_none(value) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _json_signature(value) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        return str(value)
+
+
+def _append_raw_tool_event(
+    events: list[dict],
+    event_type: str,
+    raw_block,
+    *,
+    source: str,
+    provider_protocol: str | None = None,
+    message_index: int | None = None,
+    message_role: str | None = None,
+    message_type: str | None = None,
+    content_index: int | None = None,
+    tool_call_id: str | None = None,
+    tool_use_id: str | None = None,
+    tool_name: str | None = None,
+) -> None:
+    payload = {
+        "source": source,
+        "rawBlock": raw_block,
+    }
+    if provider_protocol:
+        payload["providerProtocol"] = provider_protocol
+    if message_index is not None:
+        payload["messageIndex"] = message_index
+    if message_role:
+        payload["messageRole"] = message_role
+    if message_type:
+        payload["messageType"] = message_type
+    if content_index is not None:
+        payload["contentIndex"] = content_index
+    if tool_call_id:
+        payload["toolCallId"] = tool_call_id
+    if tool_use_id:
+        payload["toolUseId"] = tool_use_id
+    if tool_name:
+        payload["toolName"] = tool_name
+    events.append({"type": event_type, "payload": payload})
+
+
+def _dedupe_raw_tool_events(events: list[dict]) -> list[dict]:
+    deduped: list[dict] = []
+    seen: set[str] = set()
+    for event in events:
+        signature = _json_signature(
+            {
+                "type": event.get("type"),
+                "payload": event.get("payload"),
+            }
+        )
+        if signature in seen:
+            continue
+        seen.add(signature)
+        deduped.append(event)
+    return deduped
+
+
+def _extract_raw_tool_events_from_content_part(
+    events: list[dict],
+    part: dict,
+    *,
+    source: str,
+    provider_protocol: str,
+    message_index: int | None,
+    message_role: str | None,
+    message_type: str | None,
+    content_index: int | None,
+) -> None:
+    part_type = _string_or_none(part.get("type"))
+    if part_type == "tool_use":
+        _append_raw_tool_event(
+            events,
+            "tool_call_raw",
+            part,
+            source=source,
+            provider_protocol=provider_protocol,
+            message_index=message_index,
+            message_role=message_role,
+            message_type=message_type,
+            content_index=content_index,
+            tool_call_id=_string_or_none(part.get("id")),
+            tool_name=_string_or_none(part.get("name")),
+        )
+    if part_type == "tool_result":
+        _append_raw_tool_event(
+            events,
+            "tool_result_raw",
+            part,
+            source=source,
+            provider_protocol=provider_protocol,
+            message_index=message_index,
+            message_role=message_role,
+            message_type=message_type,
+            content_index=content_index,
+            tool_use_id=_string_or_none(part.get("tool_use_id")),
+            tool_name=_string_or_none(part.get("name")),
+        )
+
+    function_call = part.get("functionCall")
+    if isinstance(function_call, dict):
+        _append_raw_tool_event(
+            events,
+            "tool_call_raw",
+            part,
+            source=source,
+            provider_protocol="gemini",
+            message_index=message_index,
+            message_role=message_role,
+            message_type=message_type,
+            content_index=content_index,
+            tool_name=_string_or_none(function_call.get("name")),
+        )
+
+    function_response = part.get("functionResponse")
+    if isinstance(function_response, dict):
+        _append_raw_tool_event(
+            events,
+            "tool_result_raw",
+            part,
+            source=source,
+            provider_protocol="gemini",
+            message_index=message_index,
+            message_role=message_role,
+            message_type=message_type,
+            content_index=content_index,
+            tool_name=_string_or_none(function_response.get("name")),
+        )
+
+
+def extract_raw_tool_events_from_messages(messages) -> list[dict]:
+    if not isinstance(messages, list):
+        return []
+
+    events: list[dict] = []
+    for message_index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+
+        message_role = _string_or_none(message.get("role"))
+        message_type = _string_or_none(message.get("type"))
+        content = message.get("content", message.get("parts"))
+
+        if isinstance(content, list):
+            for content_index, part in enumerate(content):
+                if not isinstance(part, dict):
+                    continue
+                _extract_raw_tool_events_from_content_part(
+                    events,
+                    part,
+                    source="messages",
+                    provider_protocol="claude",
+                    message_index=message_index,
+                    message_role=message_role,
+                    message_type=message_type,
+                    content_index=content_index,
+                )
+
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for content_index, tool_call in enumerate(tool_calls):
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function")
+                _append_raw_tool_event(
+                    events,
+                    "tool_call_raw",
+                    tool_call,
+                    source="messages",
+                    provider_protocol="openai_chat",
+                    message_index=message_index,
+                    message_role=message_role,
+                    message_type=message_type,
+                    content_index=content_index,
+                    tool_call_id=_string_or_none(tool_call.get("id")),
+                    tool_name=_string_or_none(function.get("name"))
+                    if isinstance(function, dict)
+                    else None,
+                )
+
+        function_call = message.get("function_call")
+        if isinstance(function_call, dict):
+            _append_raw_tool_event(
+                events,
+                "tool_call_raw",
+                function_call,
+                source="messages",
+                provider_protocol="openai_chat",
+                message_index=message_index,
+                message_role=message_role,
+                message_type=message_type,
+                tool_call_id=_string_or_none(message.get("tool_call_id")),
+                tool_name=_string_or_none(function_call.get("name")),
+            )
+
+        if message_role == "tool":
+            _append_raw_tool_event(
+                events,
+                "tool_result_raw",
+                message,
+                source="messages",
+                provider_protocol="openai_chat",
+                message_index=message_index,
+                message_role=message_role,
+                message_type=message_type,
+                tool_use_id=_string_or_none(message.get("tool_call_id")),
+                tool_name=_string_or_none(message.get("name")),
+            )
+
+        if message_type == "function_call":
+            _append_raw_tool_event(
+                events,
+                "tool_call_raw",
+                message,
+                source="messages",
+                provider_protocol="response_api",
+                message_index=message_index,
+                message_role=message_role,
+                message_type=message_type,
+                tool_call_id=_string_or_none(message.get("call_id"))
+                or _string_or_none(message.get("id")),
+                tool_name=_string_or_none(message.get("name")),
+            )
+
+        if message_type == "function_call_output":
+            _append_raw_tool_event(
+                events,
+                "tool_result_raw",
+                message,
+                source="messages",
+                provider_protocol="response_api",
+                message_index=message_index,
+                message_role=message_role,
+                message_type=message_type,
+                tool_use_id=_string_or_none(message.get("call_id"))
+                or _string_or_none(message.get("id")),
+                tool_name=_string_or_none(message.get("name")),
+            )
+
+    return _dedupe_raw_tool_events(events)
+
+
 def extract_session_events_from_messages(messages) -> list[dict]:
     if not isinstance(messages, list):
         return []
@@ -346,6 +596,151 @@ def _extract_from_gemini_object(payload: dict, text_parts: list[str], tool_uses:
                 )
 
 
+def _extract_raw_tool_events_from_claude_object(payload: dict, raw_events: list[dict]):
+    content = payload.get("content")
+    if not isinstance(content, list):
+        return
+    for content_index, block in enumerate(content):
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            continue
+        _append_raw_tool_event(
+            raw_events,
+            "tool_call_raw",
+            block,
+            source="response_body",
+            provider_protocol="claude",
+            message_index=0,
+            message_role="assistant",
+            content_index=content_index,
+            tool_call_id=_string_or_none(block.get("id")),
+            tool_name=_string_or_none(block.get("name")),
+        )
+
+
+def _extract_raw_tool_events_from_openai_chat_object(payload: dict, raw_events: list[dict]):
+    choices = payload.get("choices")
+    if not isinstance(choices, list):
+        return
+    for choice_index, choice in enumerate(choices):
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            continue
+
+        message_role = _string_or_none(message.get("role"))
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for content_index, tool_call in enumerate(tool_calls):
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function")
+                _append_raw_tool_event(
+                    raw_events,
+                    "tool_call_raw",
+                    tool_call,
+                    source="response_body",
+                    provider_protocol="openai_chat",
+                    message_index=choice_index,
+                    message_role=message_role,
+                    content_index=content_index,
+                    tool_call_id=_string_or_none(tool_call.get("id")),
+                    tool_name=_string_or_none(function.get("name"))
+                    if isinstance(function, dict)
+                    else None,
+                )
+
+        function_call = message.get("function_call")
+        if isinstance(function_call, dict):
+            _append_raw_tool_event(
+                raw_events,
+                "tool_call_raw",
+                function_call,
+                source="response_body",
+                provider_protocol="openai_chat",
+                message_index=choice_index,
+                message_role=message_role,
+                tool_call_id=_string_or_none(message.get("tool_call_id")),
+                tool_name=_string_or_none(function_call.get("name")),
+            )
+
+
+def _extract_raw_tool_events_from_response_api_object(payload: dict, raw_events: list[dict]):
+    output = payload.get("output")
+    if not isinstance(output, list):
+        return
+    for item_index, item in enumerate(output):
+        if not isinstance(item, dict):
+            continue
+        item_type = _string_or_none(item.get("type"))
+        if item_type == "function_call":
+            _append_raw_tool_event(
+                raw_events,
+                "tool_call_raw",
+                item,
+                source="response_body",
+                provider_protocol="response_api",
+                message_index=item_index,
+                message_type=item_type,
+                tool_call_id=_string_or_none(item.get("call_id"))
+                or _string_or_none(item.get("id")),
+                tool_name=_string_or_none(item.get("name")),
+            )
+        if item_type == "function_call_output":
+            _append_raw_tool_event(
+                raw_events,
+                "tool_result_raw",
+                item,
+                source="response_body",
+                provider_protocol="response_api",
+                message_index=item_index,
+                message_type=item_type,
+                tool_use_id=_string_or_none(item.get("call_id"))
+                or _string_or_none(item.get("id")),
+                tool_name=_string_or_none(item.get("name")),
+            )
+
+
+def _extract_raw_tool_events_from_gemini_object(payload: dict, raw_events: list[dict]):
+    candidates = payload.get("candidates")
+    if not isinstance(candidates, list):
+        return
+    for candidate_index, candidate in enumerate(candidates):
+        if not isinstance(candidate, dict):
+            continue
+        content = candidate.get("content")
+        parts = content.get("parts") if isinstance(content, dict) else None
+        if not isinstance(parts, list):
+            continue
+        for content_index, part in enumerate(parts):
+            if not isinstance(part, dict):
+                continue
+            function_call = part.get("functionCall")
+            if isinstance(function_call, dict):
+                _append_raw_tool_event(
+                    raw_events,
+                    "tool_call_raw",
+                    part,
+                    source="response_body",
+                    provider_protocol="gemini",
+                    message_index=candidate_index,
+                    content_index=content_index,
+                    tool_name=_string_or_none(function_call.get("name")),
+                )
+            function_response = part.get("functionResponse")
+            if isinstance(function_response, dict):
+                _append_raw_tool_event(
+                    raw_events,
+                    "tool_result_raw",
+                    part,
+                    source="response_body",
+                    provider_protocol="gemini",
+                    message_index=candidate_index,
+                    content_index=content_index,
+                    tool_name=_string_or_none(function_response.get("name")),
+                )
+
+
 def _extract_from_claude_stream_events(
     events: list[dict], text_parts: list[str], tool_uses: list[dict]
 ):
@@ -485,6 +880,240 @@ def _extract_from_response_stream_events(
                 tool_uses.append({"name": name, "input": _parse_tool_input(args)})
 
 
+def _extract_raw_tool_events_from_claude_stream_events(
+    events: list[dict], raw_events: list[dict]
+):
+    tool_use_by_index: dict[int, dict] = {}
+    unordered_tool_uses: list[dict] = []
+    for event in events:
+        data = event.get("data")
+        if not isinstance(data, dict):
+            continue
+        event_type = data.get("type")
+        if event_type == "content_block_start":
+            content_block = data.get("content_block")
+            if isinstance(content_block, dict) and content_block.get("type") == "tool_use":
+                index = data.get("index") if isinstance(data.get("index"), int) else None
+                block = {
+                    "type": "tool_use",
+                    "id": content_block.get("id") if isinstance(content_block.get("id"), str) else None,
+                    "name": content_block.get("name") if isinstance(content_block.get("name"), str) else None,
+                    "input": content_block.get("input"),
+                    "inputJson": None,
+                }
+                if index is None:
+                    unordered_tool_uses.append(block)
+                else:
+                    tool_use_by_index[index] = block
+        if event_type == "content_block_delta":
+            delta = data.get("delta") if isinstance(data.get("delta"), dict) else None
+            index = data.get("index") if isinstance(data.get("index"), int) else None
+            if delta and delta.get("type") == "input_json_delta":
+                if index is None or not isinstance(delta.get("partial_json"), str):
+                    continue
+                existing = tool_use_by_index.get(index)
+                if not existing:
+                    continue
+                existing["inputJson"] = (existing.get("inputJson") or "") + delta["partial_json"]
+                tool_use_by_index[index] = existing
+
+    for content_index, block in sorted(tool_use_by_index.items()):
+        raw_block = {"type": "tool_use"}
+        if block.get("id") is not None:
+            raw_block["id"] = block.get("id")
+        if block.get("name") is not None:
+            raw_block["name"] = block.get("name")
+        input_value = block.get("input")
+        if input_value is None and block.get("inputJson"):
+            input_value = _parse_tool_input(block.get("inputJson"))
+        if input_value is not None:
+            raw_block["input"] = input_value
+        _append_raw_tool_event(
+            raw_events,
+            "tool_call_raw",
+            raw_block,
+            source="response_body",
+            provider_protocol="claude",
+            message_index=0,
+            message_role="assistant",
+            content_index=content_index,
+            tool_call_id=_string_or_none(block.get("id")),
+            tool_name=_string_or_none(block.get("name")),
+        )
+
+    for block in unordered_tool_uses:
+        raw_block = {"type": "tool_use"}
+        if block.get("id") is not None:
+            raw_block["id"] = block.get("id")
+        if block.get("name") is not None:
+            raw_block["name"] = block.get("name")
+        if block.get("input") is not None:
+            raw_block["input"] = block.get("input")
+        _append_raw_tool_event(
+            raw_events,
+            "tool_call_raw",
+            raw_block,
+            source="response_body",
+            provider_protocol="claude",
+            message_index=0,
+            message_role="assistant",
+            tool_call_id=_string_or_none(block.get("id")),
+            tool_name=_string_or_none(block.get("name")),
+        )
+
+
+def _extract_raw_tool_events_from_openai_stream_events(
+    events: list[dict], raw_events: list[dict]
+):
+    tool_call_map: dict[str, dict] = {}
+    for event in events:
+        data = event.get("data")
+        if not isinstance(data, dict):
+            continue
+        choices = data.get("choices")
+        if not isinstance(choices, list):
+            continue
+        for choice_index, choice in enumerate(choices):
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta")
+            if not isinstance(delta, dict):
+                continue
+            tool_calls = delta.get("tool_calls")
+            if not isinstance(tool_calls, list):
+                continue
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function")
+                content_index = (
+                    tool_call.get("index") if isinstance(tool_call.get("index"), int) else None
+                )
+                key = (
+                    tool_call.get("id")
+                    if isinstance(tool_call.get("id"), str)
+                    else f"{choice_index}:{content_index if content_index is not None else len(tool_call_map)}"
+                )
+                existing = tool_call_map.get(key) or {
+                    "id": tool_call.get("id") if isinstance(tool_call.get("id"), str) else None,
+                    "type": tool_call.get("type") if isinstance(tool_call.get("type"), str) else "function",
+                    "name": None,
+                    "arguments": "",
+                    "messageIndex": choice_index,
+                    "contentIndex": content_index,
+                }
+                if isinstance(function, dict) and isinstance(function.get("name"), str):
+                    existing["name"] = function.get("name")
+                if isinstance(function, dict) and isinstance(function.get("arguments"), str):
+                    existing["arguments"] += function.get("arguments")
+                tool_call_map[key] = existing
+
+    for entry in tool_call_map.values():
+        raw_block = {
+            "type": entry.get("type") or "function",
+            "function": {},
+        }
+        if entry.get("id") is not None:
+            raw_block["id"] = entry.get("id")
+        if entry.get("name") is not None:
+            raw_block["function"]["name"] = entry.get("name")
+        if entry.get("arguments"):
+            raw_block["function"]["arguments"] = entry.get("arguments")
+        _append_raw_tool_event(
+            raw_events,
+            "tool_call_raw",
+            raw_block,
+            source="response_body",
+            provider_protocol="openai_chat",
+            message_index=entry.get("messageIndex"),
+            message_role="assistant",
+            content_index=entry.get("contentIndex"),
+            tool_call_id=_string_or_none(entry.get("id")),
+            tool_name=_string_or_none(entry.get("name")),
+        )
+
+
+def _extract_raw_tool_events_from_response_stream_events(
+    events: list[dict], raw_events: list[dict]
+):
+    final_response_obj: dict | None = None
+    for event in events:
+        data = event.get("data")
+        if not isinstance(data, dict):
+            continue
+        response_obj = data.get("response")
+        if isinstance(response_obj, dict):
+            final_response_obj = response_obj
+
+    if final_response_obj is not None:
+        _extract_raw_tool_events_from_response_api_object(final_response_obj, raw_events)
+
+    for event in events:
+        data = event.get("data")
+        if not isinstance(data, dict):
+            continue
+        event_type = data.get("type") if isinstance(data.get("type"), str) else ""
+        if event_type in {"response.output_item.added", "response.output_item.done"}:
+            item = data.get("item")
+            if not isinstance(item, dict):
+                continue
+            item_type = _string_or_none(item.get("type"))
+            if item_type == "function_call":
+                _append_raw_tool_event(
+                    raw_events,
+                    "tool_call_raw",
+                    item,
+                    source="response_body",
+                    provider_protocol="response_api",
+                    message_index=data.get("output_index")
+                    if isinstance(data.get("output_index"), int)
+                    else None,
+                    message_type=item_type,
+                    tool_call_id=_string_or_none(item.get("call_id"))
+                    or _string_or_none(item.get("id")),
+                    tool_name=_string_or_none(item.get("name")),
+                )
+            if item_type == "function_call_output":
+                _append_raw_tool_event(
+                    raw_events,
+                    "tool_result_raw",
+                    item,
+                    source="response_body",
+                    provider_protocol="response_api",
+                    message_index=data.get("output_index")
+                    if isinstance(data.get("output_index"), int)
+                    else None,
+                    message_type=item_type,
+                    tool_use_id=_string_or_none(item.get("call_id"))
+                    or _string_or_none(item.get("id")),
+                    tool_name=_string_or_none(item.get("name")),
+                )
+        elif "function_call" in event_type:
+            raw_block = {}
+            for key in ("id", "call_id", "name", "arguments", "input", "type"):
+                if key in data:
+                    raw_block[key] = data.get(key)
+            function = data.get("function")
+            if isinstance(function, dict):
+                raw_block["function"] = function
+            if not raw_block:
+                continue
+            tool_name = _string_or_none(raw_block.get("name"))
+            if tool_name is None and isinstance(function, dict):
+                tool_name = _string_or_none(function.get("name"))
+            _append_raw_tool_event(
+                raw_events,
+                "tool_call_raw",
+                raw_block,
+                source="response_body",
+                provider_protocol="response_api",
+                message_type=event_type,
+                tool_call_id=_string_or_none(raw_block.get("call_id"))
+                or _string_or_none(raw_block.get("id")),
+                tool_name=tool_name,
+            )
+
+
 def _detect_sse_format(events: list[dict]) -> str | None:
     for event in events:
         data = event.get("data")
@@ -568,9 +1197,12 @@ def _dedupe_tool_uses(tool_uses: list[dict]) -> list[dict]:
     return deduped
 
 
-def extract_llm_artifacts_from_response_text(response_text: str) -> tuple[str | None, list[dict]]:
+def extract_response_artifacts_from_response_text(
+    response_text: str,
+) -> tuple[str | None, list[dict], list[dict]]:
     text_parts: list[str] = []
     tool_uses: list[dict] = []
+    raw_events: list[dict] = []
 
     if is_sse_text(response_text):
         events = [
@@ -584,57 +1216,88 @@ def extract_llm_artifacts_from_response_text(response_text: str) -> tuple[str | 
         detected_format = _detect_sse_format(events)
         if detected_format == "claude":
             _extract_from_claude_stream_events(events, text_parts, tool_uses)
+            _extract_raw_tool_events_from_claude_stream_events(events, raw_events)
         elif detected_format == "openai":
             _extract_from_openai_stream_events(events, text_parts, tool_uses)
+            _extract_raw_tool_events_from_openai_stream_events(events, raw_events)
         elif detected_format == "response":
             _extract_from_response_stream_events(events, text_parts, tool_uses)
+            _extract_raw_tool_events_from_response_stream_events(events, raw_events)
         elif detected_format == "gemini":
             for evt in events:
                 if isinstance(evt.get("data"), dict):
-                    _extract_from_gemini_object(
-                        evt.get("data"), text_parts, tool_uses
-                    )
+                    _extract_from_gemini_object(evt.get("data"), text_parts, tool_uses)
+                    _extract_raw_tool_events_from_gemini_object(evt.get("data"), raw_events)
         else:
             _extract_from_claude_stream_events(events, text_parts, tool_uses)
             _extract_from_openai_stream_events(events, text_parts, tool_uses)
             _extract_from_response_stream_events(events, text_parts, tool_uses)
+            _extract_raw_tool_events_from_claude_stream_events(events, raw_events)
+            _extract_raw_tool_events_from_openai_stream_events(events, raw_events)
+            _extract_raw_tool_events_from_response_stream_events(events, raw_events)
             for evt in events:
                 if isinstance(evt.get("data"), dict):
-                    _extract_from_gemini_object(
-                        evt.get("data"), text_parts, tool_uses
-                    )
+                    _extract_from_gemini_object(evt.get("data"), text_parts, tool_uses)
+                    _extract_raw_tool_events_from_gemini_object(evt.get("data"), raw_events)
+        raw_events = _dedupe_raw_tool_events(raw_events)
+        tool_uses = _dedupe_tool_uses(tool_uses)
+        answer_text = "".join(text_parts)
+        return (answer_text if answer_text.strip() else None, tool_uses, raw_events)
+
+    try:
+        parsed = json.loads(response_text)
+    except Exception:
+        return None, [], []
+
+    if not isinstance(parsed, dict):
+        return None, [], []
+
+    detected_format = _detect_json_format(parsed)
+    response_obj = parsed.get("response")
+    if detected_format == "claude":
+        _extract_from_claude_object(parsed, text_parts, tool_uses)
+        _extract_raw_tool_events_from_claude_object(parsed, raw_events)
+    elif detected_format == "openai":
+        _extract_from_openai_chat_object(parsed, text_parts, tool_uses)
+        _extract_raw_tool_events_from_openai_chat_object(parsed, raw_events)
+    elif detected_format == "response":
+        if isinstance(response_obj, dict):
+            _extract_from_response_api_object(response_obj, text_parts, tool_uses)
+            _extract_raw_tool_events_from_response_api_object(response_obj, raw_events)
+        _extract_from_response_api_object(parsed, text_parts, tool_uses)
+        _extract_raw_tool_events_from_response_api_object(parsed, raw_events)
+    elif detected_format == "gemini":
+        if isinstance(response_obj, dict):
+            _extract_from_gemini_object(response_obj, text_parts, tool_uses)
+            _extract_raw_tool_events_from_gemini_object(response_obj, raw_events)
+        _extract_from_gemini_object(parsed, text_parts, tool_uses)
+        _extract_raw_tool_events_from_gemini_object(parsed, raw_events)
     else:
-        try:
-            parsed = json.loads(response_text)
-        except Exception:
-            return None, []
+        if isinstance(response_obj, dict):
+            _extract_from_response_api_object(response_obj, text_parts, tool_uses)
+            _extract_from_gemini_object(response_obj, text_parts, tool_uses)
+            _extract_raw_tool_events_from_response_api_object(response_obj, raw_events)
+            _extract_raw_tool_events_from_gemini_object(response_obj, raw_events)
+        _extract_from_claude_object(parsed, text_parts, tool_uses)
+        _extract_from_openai_chat_object(parsed, text_parts, tool_uses)
+        _extract_from_response_api_object(parsed, text_parts, tool_uses)
+        _extract_from_gemini_object(parsed, text_parts, tool_uses)
+        _extract_raw_tool_events_from_claude_object(parsed, raw_events)
+        _extract_raw_tool_events_from_openai_chat_object(parsed, raw_events)
+        _extract_raw_tool_events_from_response_api_object(parsed, raw_events)
+        _extract_raw_tool_events_from_gemini_object(parsed, raw_events)
 
-        if isinstance(parsed, dict):
-            detected_format = _detect_json_format(parsed)
-            response_obj = parsed.get("response")
-            if detected_format == "claude":
-                _extract_from_claude_object(parsed, text_parts, tool_uses)
-            elif detected_format == "openai":
-                _extract_from_openai_chat_object(parsed, text_parts, tool_uses)
-            elif detected_format == "response":
-                if isinstance(response_obj, dict):
-                    _extract_from_response_api_object(response_obj, text_parts, tool_uses)
-                _extract_from_response_api_object(parsed, text_parts, tool_uses)
-            elif detected_format == "gemini":
-                if isinstance(response_obj, dict):
-                    _extract_from_gemini_object(response_obj, text_parts, tool_uses)
-                _extract_from_gemini_object(parsed, text_parts, tool_uses)
-            else:
-                if isinstance(response_obj, dict):
-                    _extract_from_response_api_object(response_obj, text_parts, tool_uses)
-                    _extract_from_gemini_object(response_obj, text_parts, tool_uses)
-                _extract_from_claude_object(parsed, text_parts, tool_uses)
-                _extract_from_openai_chat_object(parsed, text_parts, tool_uses)
-                _extract_from_response_api_object(parsed, text_parts, tool_uses)
-                _extract_from_gemini_object(parsed, text_parts, tool_uses)
-
+    raw_events = _dedupe_raw_tool_events(raw_events)
     tool_uses = _dedupe_tool_uses(tool_uses)
     answer_text = "".join(text_parts)
-    if answer_text.strip():
-        return answer_text, tool_uses
-    return None, tool_uses
+    return (answer_text if answer_text.strip() else None, tool_uses, raw_events)
+
+
+def extract_raw_tool_events_from_response_text(response_text: str) -> list[dict]:
+    _, _, raw_events = extract_response_artifacts_from_response_text(response_text)
+    return raw_events
+
+
+def extract_llm_artifacts_from_response_text(response_text: str) -> tuple[str | None, list[dict]]:
+    answer_text, tool_uses, _ = extract_response_artifacts_from_response_text(response_text)
+    return answer_text, tool_uses

@@ -39,7 +39,15 @@ Primary session event output:
 - `session_meta`
 - `user_input`
 - `tool_io`
+- `tool_call_raw`
+- `tool_result_raw`
 - `llm_answer`
+
+Event semantics:
+
+- `tool_io` keeps the compatibility-friendly text projection of tool input/output.
+- `tool_call_raw` stores protocol-native tool call blocks with lightweight envelope fields such as protocol, message index, content index, tool id, and tool name.
+- `tool_result_raw` stores protocol-native tool result blocks with lightweight envelope fields such as protocol, message index, content index, and tool use id.
 
 Sidecar output:
 

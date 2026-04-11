@@ -18,7 +18,8 @@ from output_writer import (
 )
 from session_events import (
     build_event,
-    extract_llm_artifacts_from_response_text,
+    extract_response_artifacts_from_response_text,
+    extract_raw_tool_events_from_messages,
     extract_session_events_from_messages,
     tool_input_to_text,
 )
@@ -220,6 +221,8 @@ def _extract_message_events(raw_messages, seq: int) -> list[dict]:
     events: list[dict] = []
     for ev in extract_session_events_from_messages(messages):
         events.append(build_event(ev["type"], ev["payload"], seq))
+    for ev in extract_raw_tool_events_from_messages(messages):
+        events.append(build_event(ev["type"], ev["payload"], seq))
     return events
 
 
@@ -228,8 +231,12 @@ def _extract_response_events(raw_response, seq: int) -> list[dict]:
     if not response_text:
         return []
 
-    answer_text, tool_uses = extract_llm_artifacts_from_response_text(response_text)
+    answer_text, tool_uses, raw_events = extract_response_artifacts_from_response_text(
+        response_text
+    )
     events: list[dict] = []
+    for raw_event in raw_events:
+        events.append(build_event(raw_event["type"], raw_event["payload"], seq))
     seen_inputs: set[str] = set()
     for tool_use in tool_uses:
         input_text = tool_use.get("input")
