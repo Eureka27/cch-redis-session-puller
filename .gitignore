@@ -1,4 +1,6 @@
 .venv/
+.env.local
+.env.systemd
 __pycache__/
 *.pyc
 state.json

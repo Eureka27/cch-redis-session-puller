@@ -10,11 +10,14 @@ import time
 import redis
 
 from config import load_redis_config
+from export_quota import ExportRootQuota
 from export_state import STATE_VERSION, load_state, save_state
 from output_writer import (
     append_jsonl,
+    append_jsonl_payload,
     build_session_file_path,
     normalize_json_value,
+    render_jsonl_payload,
 )
 from session_events import (
     build_event,
@@ -31,17 +34,39 @@ STATE_DEFAULT = {"version": STATE_VERSION, "sessions": {}}
 logger = logging.getLogger(__name__)
 
 
-def append_session_events(dest_dir: str, session_id: str, events: list[dict]) -> str:
+def append_session_events(
+    dest_dir: str,
+    session_id: str,
+    events: list[dict],
+    quota: ExportRootQuota | None = None,
+) -> str:
     if not events:
         return "empty"
-    append_jsonl(build_session_file_path(dest_dir, session_id), events)
+    path = build_session_file_path(dest_dir, session_id)
+    payload = render_jsonl_payload(events)
+    if quota is not None:
+        if not quota.try_append_payloads([(path, payload)]):
+            return "blocked"
+    else:
+        append_jsonl(path, events)
     return "appended"
 
 
-def append_session_sidecars(sidecar_dir: str, session_id: str, events: list[dict]) -> str:
+def append_session_sidecars(
+    sidecar_dir: str,
+    session_id: str,
+    events: list[dict],
+    quota: ExportRootQuota | None = None,
+) -> str:
     if not events:
         return "empty"
-    append_jsonl(build_session_file_path(sidecar_dir, session_id), events)
+    path = build_session_file_path(sidecar_dir, session_id)
+    payload = render_jsonl_payload(events)
+    if quota is not None:
+        if not quota.try_append_payloads([(path, payload)]):
+            return "blocked"
+    else:
+        append_jsonl(path, events)
     return "appended"
 
 
@@ -196,18 +221,56 @@ def _append_session_snapshot(
     state_key: str,
     event_type: str,
     payload: dict[str, str],
-) -> None:
+    quota: ExportRootQuota | None,
+) -> bool:
     if not payload:
-        return
+        return True
     signature = _stable_signature(payload)
     if entry.get(state_key) == signature:
-        return
-    append_session_sidecars(
+        return True
+    result = append_session_sidecars(
         sidecar_dir,
         session_id,
         [build_event(event_type, payload, None)],
+        quota,
     )
+    if result != "appended":
+        return False
     entry[state_key] = signature
+    return True
+
+
+def _append_session_seq(
+    dest_dir: str,
+    sidecar_dir: str,
+    session_id: str,
+    events: list[dict],
+    sidecars: list[dict],
+    quota: ExportRootQuota | None,
+) -> bool:
+    payloads: list[tuple] = []
+    if events:
+        payloads.append(
+            (
+                build_session_file_path(dest_dir, session_id),
+                render_jsonl_payload(events),
+            )
+        )
+    if sidecars:
+        payloads.append(
+            (
+                build_session_file_path(sidecar_dir, session_id),
+                render_jsonl_payload(sidecars),
+            )
+        )
+    if not payloads:
+        return True
+    if quota is not None:
+        return quota.try_append_payloads(payloads)
+    for path, payload in payloads:
+        if payload:
+            append_jsonl_payload(path, payload)
+    return True
 
 
 def _extract_message_events(raw_messages, seq: int) -> list[dict]:
@@ -342,6 +405,7 @@ def process_session(
     sidecar_dir: str,
     now_ts: float,
     skip_seconds: int,
+    quota: ExportRootQuota | None,
 ) -> None:
     entry = _get_state_entry(state, session_id)
     cursor_seq = _get_cursor_seq(entry)
@@ -349,12 +413,26 @@ def process_session(
 
     session_info = _read_hash(r, f"session:{session_id}:info")
     session_usage = _read_hash(r, f"session:{session_id}:usage")
-    _append_session_snapshot(
-        sidecar_dir, session_id, entry, "last_info_signature", "session_info", session_info
-    )
-    _append_session_snapshot(
-        sidecar_dir, session_id, entry, "last_usage_signature", "session_usage", session_usage
-    )
+    if not _append_session_snapshot(
+        sidecar_dir,
+        session_id,
+        entry,
+        "last_info_signature",
+        "session_info",
+        session_info,
+        quota,
+    ):
+        return
+    if not _append_session_snapshot(
+        sidecar_dir,
+        session_id,
+        entry,
+        "last_usage_signature",
+        "session_usage",
+        session_usage,
+        quota,
+    ):
+        return
 
     seq_value = r.get(f"session:{session_id}:seq")
     if not seq_value:
@@ -373,11 +451,13 @@ def process_session(
         if should_try_meta:
             session_meta_payload = _build_session_meta_payload(session_info)
             if session_meta_payload:
-                append_session_events(
+                if append_session_events(
                     dest_dir,
                     session_id,
                     [build_event("session_meta", session_meta_payload, None)],
-                )
+                    quota,
+                ) != "appended":
+                    return
                 entry["meta_written"] = True
                 entry.pop("meta_retry_at", None)
             else:
@@ -421,8 +501,8 @@ def process_session(
         if response_ready:
             events.extend(_extract_response_events(raw_response, seq))
         sidecars.extend(_extract_sidecar_events(records, seq))
-        append_session_events(dest_dir, session_id, events)
-        append_session_sidecars(sidecar_dir, session_id, sidecars)
+        if not _append_session_seq(dest_dir, sidecar_dir, session_id, events, sidecars, quota):
+            break
 
         if not messages_ready:
             _clear_missing(entry, "msg", seq)
@@ -460,6 +540,11 @@ def scan_sessions(r: redis.Redis) -> list[str]:
 def run_once(config: dict) -> None:
     r = redis.Redis.from_url(config["redis_url"], decode_responses=False)
     state = load_state(config["state_path"], STATE_DEFAULT)
+    quota = ExportRootQuota(
+        config["export_root"],
+        config["export_max_bytes"],
+        logger=logger,
+    )
 
     now_ts = time.time()
     session_ids = scan_sessions(r)
@@ -472,6 +557,7 @@ def run_once(config: dict) -> None:
             config["sidecar_dir"],
             now_ts,
             config["missing_skip_seconds"],
+            quota,
         )
 
     save_state(config["state_path"], state)

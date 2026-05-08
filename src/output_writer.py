@@ -34,20 +34,34 @@ def normalize_json_value(value):
     return value
 
 
-def append_jsonl(path: Path, records: list[dict]) -> None:
+def render_jsonl_payload(records: list[dict]) -> bytes:
     if not records:
-        return
-    ensure_dir(str(path.parent))
-    with open(path, "a", encoding="utf-8") as f:
-        for record in records:
-            f.write(
-                json.dumps(
-                    normalize_json_value(record),
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
+        return b""
+    parts: list[str] = []
+    for record in records:
+        parts.append(
+            json.dumps(
+                normalize_json_value(record),
+                ensure_ascii=False,
+                separators=(",", ":"),
             )
-            f.write("\n")
+        )
+        parts.append("\n")
+    return "".join(parts).encode("utf-8")
+
+
+def append_jsonl_payload(path: Path, payload: bytes) -> int:
+    if not payload:
+        return 0
+    ensure_dir(str(path.parent))
+    with open(path, "ab") as f:
+        f.write(payload)
+    return len(payload)
+
+
+def append_jsonl(path: Path, records: list[dict]) -> int:
+    payload = render_jsonl_payload(records)
+    return append_jsonl_payload(path, payload)
 
 
 def build_session_file_path(base_dir: str, session_id: str, suffix: str = ".json") -> Path:

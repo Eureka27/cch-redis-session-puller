@@ -4,6 +4,7 @@ set -euo pipefail
 # ===================== User Config (edit here) =====================
 DEPLOY_USER="${SUDO_USER:-${USER:-puller}}"  # systemd User=
 EXPORT_ROOT="./export"
+EXPORT_MAX_BYTES="2147483648"
 CADDY_ENABLE="0"
 CADDY_SITE_DOMAIN="apidata.example.com"
 CADDY_CONFIG_PATH="/etc/caddy/Caddyfile"
@@ -20,6 +21,12 @@ MISSING_SKIP_SECONDS="300"
 # DB connection: set DATABASE_URL or DSN.
 DATABASE_URL=""
 DSN=""
+DATABASE_CONTAINER=""
+DB_HOST=""
+DB_PORT="5432"
+DB_USER=""
+DB_PASSWORD=""
+DB_NAME=""
 DB_EXPORT_DIR="./export/db"
 DB_STATE_PATH="./export/state/db_exporter.json"
 DB_POLL_INTERVAL_SECONDS="300"
@@ -70,6 +77,7 @@ resolve_path() {
 validate_config() {
   [[ -n "${DEPLOY_USER}" ]] || fail "DEPLOY_USER cannot be empty"
   [[ -n "${EXPORT_ROOT}" ]] || fail "EXPORT_ROOT cannot be empty"
+  [[ -n "${EXPORT_MAX_BYTES}" ]] || fail "EXPORT_MAX_BYTES cannot be empty"
   [[ -n "${DEST_DIR}" ]] || fail "DEST_DIR cannot be empty"
   [[ -n "${REDIS_SIDECARS_DIR}" ]] || fail "REDIS_SIDECARS_DIR cannot be empty"
   [[ -n "${STATE_PATH}" ]] || fail "STATE_PATH cannot be empty"
@@ -85,7 +93,10 @@ validate_config() {
   fi
 
   if [[ -z "${DATABASE_URL}" && -z "${DSN}" ]]; then
-    fail "DATABASE_URL and DSN cannot both be empty"
+    [[ -n "${DB_HOST}" || -n "${DATABASE_CONTAINER}" ]] || fail "DATABASE_URL/DSN 为空时，DB_HOST 或 DATABASE_CONTAINER 至少要有一个"
+    [[ -n "${DB_USER}" ]] || fail "DATABASE_URL/DSN 为空时，DB_USER 不能为空"
+    [[ -n "${DB_PASSWORD}" ]] || fail "DATABASE_URL/DSN 为空时，DB_PASSWORD 不能为空"
+    [[ -n "${DB_NAME}" ]] || fail "DATABASE_URL/DSN 为空时，DB_NAME 不能为空"
   fi
 
   if [[ "${CADDY_ENABLE}" != "0" && "${CADDY_ENABLE}" != "1" ]]; then
@@ -112,6 +123,7 @@ write_env_file() {
 
   cat > "${LOCAL_ENV_PATH}" <<ENV
 EXPORT_ROOT=${EXPORT_ROOT}
+EXPORT_MAX_BYTES=${EXPORT_MAX_BYTES}
 REDIS_CONTAINER=${REDIS_CONTAINER}
 REDIS_URL=${REDIS_URL}
 DEST_DIR=${DEST_DIR}
@@ -121,6 +133,12 @@ POLL_INTERVAL_SECONDS=${POLL_INTERVAL_SECONDS}
 MISSING_SKIP_SECONDS=${MISSING_SKIP_SECONDS}
 DATABASE_URL=${DATABASE_URL}
 DSN=${DSN}
+DATABASE_CONTAINER=${DATABASE_CONTAINER}
+DB_HOST=${DB_HOST}
+DB_PORT=${DB_PORT}
+DB_USER=${DB_USER}
+DB_PASSWORD=${DB_PASSWORD}
+DB_NAME=${DB_NAME}
 DB_EXPORT_DIR=${DB_EXPORT_DIR}
 DB_STATE_PATH=${DB_STATE_PATH}
 DB_POLL_INTERVAL_SECONDS=${DB_POLL_INTERVAL_SECONDS}
@@ -131,6 +149,15 @@ ENV
 }
 
 prepare_python() {
+  if command -v uv >/dev/null 2>&1; then
+    if [[ ! -x "${REPO_ROOT}/.venv/bin/python3" ]]; then
+      uv venv --clear "${REPO_ROOT}/.venv"
+    fi
+
+    uv pip install --python "${REPO_ROOT}/.venv/bin/python" -r "${REPO_ROOT}/requirements.txt"
+    return
+  fi
+
   if [[ ! -d "${REPO_ROOT}/.venv" ]]; then
     python3 -m venv "${REPO_ROOT}/.venv"
   fi

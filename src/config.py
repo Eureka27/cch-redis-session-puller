@@ -27,7 +27,13 @@ def _build_default_path(export_root: str, *parts: str) -> str:
 
 def load_common_config() -> dict:
     export_root = _get_env("EXPORT_ROOT", "./export")
-    return {"export_root": export_root}
+    export_max_bytes = _get_int_env("EXPORT_MAX_BYTES", 2147483648)
+    if export_max_bytes < 0:
+        raise ValueError("EXPORT_MAX_BYTES must be a non-negative integer")
+    return {
+        "export_root": export_root,
+        "export_max_bytes": export_max_bytes,
+    }
 
 
 def load_redis_config() -> dict:
@@ -60,7 +66,22 @@ def load_db_config() -> dict:
     common = load_common_config()
     database_url = _get_env("DATABASE_URL") or _get_env("DSN")
     if not database_url:
-        raise ValueError("DATABASE_URL or DSN is required")
+        db_host = _get_env("DB_HOST")
+        db_port = _get_env("DB_PORT", "5432")
+        db_user = _get_env("DB_USER")
+        db_password = _get_env("DB_PASSWORD")
+        db_name = _get_env("DB_NAME")
+
+        if db_host and db_user and db_password and db_name:
+            database_url = (
+                f"host={db_host} port={db_port} dbname={db_name} "
+                f"user={db_user} password={db_password}"
+            )
+
+    if not database_url:
+        raise ValueError(
+            "DATABASE_URL or DSN is required, or set DB_HOST DB_USER DB_PASSWORD DB_NAME"
+        )
 
     db_export_root = _get_env(
         "DB_EXPORT_DIR",

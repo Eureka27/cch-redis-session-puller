@@ -14,6 +14,8 @@ Deploy `claude-code-hub` first:
 
 This project exports data that already exists in Redis and PostgreSQL. It does not add new instrumentation.
 
+When `EXPORT_MAX_BYTES` is set above `0`, both exporters treat `EXPORT_ROOT` as a hard cap. Once the current on-disk size reaches the configured limit, new writes pause. Writes automatically resume after downstream cleanup or pulling reduces usage below the cap.
+
 ## Optional: Low-Storage Source Server Setup
 
 If the source server has limited disk space:
@@ -93,6 +95,13 @@ python3 -m venv .venv
 pip install -r requirements.txt
 ```
 
+If `python3 -m venv` or `pip` is unavailable on the host but `uv` is installed:
+
+```bash
+uv venv .venv
+uv pip install --python .venv/bin/python -r requirements.txt
+```
+
 ## One-Click Deploy
 
 `deploy/deploy-oneclick.sh` installs and starts both systemd services:
@@ -105,8 +114,9 @@ It can also optionally write a Caddy site config and reload Caddy when `CADDY_EN
 Before running it, review the configuration block at the top of the script and set at least:
 
 - Redis connection: `REDIS_URL` or `REDIS_CONTAINER`
-- Database connection: `DATABASE_URL` or `DSN`
+- Database connection: `DATABASE_URL` or `DSN`, or `DATABASE_CONTAINER`/`DB_HOST` plus `DB_USER` `DB_PASSWORD` `DB_NAME`
 - Output root: `EXPORT_ROOT`
+- Optional export-root hard cap: `EXPORT_MAX_BYTES`
 - Optional public domain: `CADDY_ENABLE`, `CADDY_SITE_DOMAIN`, `CADDY_CONFIG_PATH`
 
 Run:
@@ -139,11 +149,13 @@ If Caddy already serves other sites on the host, merge the example into your exi
 Common:
 
 - `EXPORT_ROOT` default: `./export`
+- `EXPORT_MAX_BYTES` default: `2147483648` (`2 GiB`). Set `0` to disable the cap
 
 Redis puller:
 
 - `REDIS_URL` optional if `REDIS_CONTAINER` is set
 - `REDIS_CONTAINER` default: `claude-code-hub-redis`
+- If the runtime user cannot access `docker.sock`, resolve the Redis container IP ahead of time and set `REDIS_URL` explicitly
 - `DEST_DIR` default: `./export/redis/session_events`
 - `REDIS_SIDECARS_DIR` default: `./export/redis/request_sidecars`
 - `STATE_PATH` default: `./export/state/redis_puller.json`
@@ -153,6 +165,11 @@ Redis puller:
 DB exporter:
 
 - `DATABASE_URL` or `DSN`
+- `DATABASE_CONTAINER` optional if `DB_HOST` is set
+- `DB_HOST` optional if `DATABASE_CONTAINER` is set
+- If the runtime user cannot access `docker.sock`, resolve the PostgreSQL container IP ahead of time and set `DB_HOST` explicitly
+- `DB_PORT` default: `5432`
+- `DB_USER` / `DB_PASSWORD` / `DB_NAME` are required when `DATABASE_URL` and `DSN` are empty
 - `DB_EXPORT_DIR` default: `./export/db`
 - `DB_STATE_PATH` default: `./export/state/db_exporter.json`
 - `DB_POLL_INTERVAL_SECONDS` default: `300`
@@ -167,6 +184,8 @@ Optional Caddy deploy:
 Notes:
 
 - If `claude-code-hub` runs with `STORE_SESSION_MESSAGES=false` (default), Redis request and response content is redacted as `[REDACTED]`. To export full `user_input` and `llm_answer`, set `STORE_SESSION_MESSAGES=true` in `claude-code-hub`.
+- For Docker Compose deployments with project-prefixed container names such as `claude-code-hub-prod-redis-1` and `claude-code-hub-prod-postgres-1`, set `REDIS_CONTAINER` and `DATABASE_CONTAINER` explicitly instead of relying on defaults.
+- If your exporter runs as a user without Docker daemon access, prefer explicit `REDIS_URL` and `DB_HOST` over runtime container inspection.
 - The example Caddy config intentionally exposes exported files publicly. Add your own access controls if you do not want a public data site.
 
 Example:

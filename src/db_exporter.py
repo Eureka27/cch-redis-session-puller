@@ -5,13 +5,15 @@ from __future__ import annotations
 import argparse
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import psycopg
 from psycopg.rows import dict_row
 
 from config import load_db_config
+from export_quota import ExportRootQuota
 from export_state import STATE_VERSION, load_state, save_state
-from output_writer import append_jsonl, build_daily_jsonl_path
+from output_writer import append_jsonl_payload, build_daily_jsonl_path, render_jsonl_payload
 
 
 DEFAULT_STATE = {
@@ -80,6 +82,7 @@ def _export_table(
     ts_field: str,
     output_dir: str,
     batch_size: int,
+    quota: ExportRootQuota | None,
 ) -> int:
     entry = _get_table_state(state, table_name)
     cursor_ts = _parse_cursor_ts(
@@ -103,28 +106,56 @@ def _export_table(
         if not rows:
             break
 
-        grouped = {}
+        available_bytes = quota.available_bytes() if quota is not None and quota.enabled else None
+        grouped: dict[Path, list[dict]] = {}
+        batch_bytes = 0
         last_seen_ts = cursor_ts
         last_seen_id = cursor_id
+        blocked = False
+        blocked_incoming_bytes = 0
         for row in rows:
-            last_seen_ts = row[ts_field]
-            last_seen_id = int(row["id"])
             payload = row["payload"] if isinstance(row.get("payload"), dict) else None
             if payload is None:
+                last_seen_ts = row[ts_field]
+                last_seen_id = int(row["id"])
                 continue
             partition_path = build_daily_jsonl_path(output_dir, row.get("created_at"))
+            row_payload = render_jsonl_payload([payload])
+            row_bytes = len(row_payload)
+            if available_bytes is not None and batch_bytes + row_bytes > available_bytes:
+                blocked = True
+                blocked_incoming_bytes = row_bytes
+                break
             grouped.setdefault(partition_path, []).append(payload)
+            batch_bytes += row_bytes
+            last_seen_ts = row[ts_field]
+            last_seen_id = int(row["id"])
             exported += 1
 
-        for path, records in grouped.items():
-            append_jsonl(path, records)
+        if not grouped:
+            if blocked and quota is not None:
+                quota.note_blocked(blocked_incoming_bytes)
+            break
+
+        payloads = [
+            (path, render_jsonl_payload(records))
+            for path, records in grouped.items()
+            if records
+        ]
+        if quota is not None:
+            if not quota.try_append_payloads(payloads):
+                exported -= sum(len(records) for records in grouped.values())
+                break
+        else:
+            for path, payload in payloads:
+                append_jsonl_payload(path, payload)
 
         cursor_ts = last_seen_ts
         cursor_id = last_seen_id
         entry["cursor_ts"] = cursor_ts.isoformat()
         entry["cursor_id"] = cursor_id
 
-        if len(rows) < batch_size:
+        if blocked or len(rows) < batch_size:
             break
 
     return exported
@@ -133,6 +164,10 @@ def _export_table(
 def run_once(config: dict) -> dict[str, int]:
     state = load_state(config["state_path"], DEFAULT_STATE)
     results = {"message_request": 0, "usage_ledger": 0}
+    quota = ExportRootQuota(
+        config["export_root"],
+        config["export_max_bytes"],
+    )
 
     with psycopg.connect(config["database_url"], autocommit=True, row_factory=dict_row) as conn:
         results["message_request"] = _export_table(
@@ -143,6 +178,7 @@ def run_once(config: dict) -> dict[str, int]:
             ts_field="updated_at",
             output_dir=config["message_request_dir"],
             batch_size=config["batch_size"],
+            quota=quota,
         )
         results["usage_ledger"] = _export_table(
             conn=conn,
@@ -152,6 +188,7 @@ def run_once(config: dict) -> dict[str, int]:
             ts_field="created_at",
             output_dir=config["usage_ledger_dir"],
             batch_size=config["batch_size"],
+            quota=quota,
         )
 
     save_state(config["state_path"], state)

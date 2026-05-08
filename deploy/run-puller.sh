@@ -4,8 +4,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 
-REDIS_CONTAINER="${REDIS_CONTAINER:-claude-code-hub-redis}"
+DEFAULT_REDIS_CONTAINER="claude-code-hub-redis"
+REDIS_CONTAINER="${REDIS_CONTAINER:-}"
 EXPORT_ROOT="${EXPORT_ROOT:-${REPO_ROOT}/export}"
+EXPORT_MAX_BYTES="${EXPORT_MAX_BYTES:-2147483648}"
 DEST_DIR="${DEST_DIR:-${EXPORT_ROOT}/redis/session_events}"
 REDIS_SIDECARS_DIR="${REDIS_SIDECARS_DIR:-${EXPORT_ROOT}/redis/request_sidecars}"
 STATE_PATH="${STATE_PATH:-${EXPORT_ROOT}/state/redis_puller.json}"
@@ -13,10 +15,17 @@ POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-30}"
 MISSING_SKIP_SECONDS="${MISSING_SKIP_SECONDS:-300}"
 
 if [[ -z "${REDIS_URL:-}" ]]; then
-  if command -v redis-cli >/dev/null 2>&1 && redis-cli -u "redis://127.0.0.1:6379/0" ping >/dev/null 2>&1; then
+  if [[ -n "${REDIS_CONTAINER}" ]]; then
+    REDIS_IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${REDIS_CONTAINER}" 2>/dev/null || true)"
+    if [[ -z "${REDIS_IP}" ]]; then
+      echo "[cch-redis-session-puller] cannot resolve redis container ${REDIS_CONTAINER}" >&2
+      exit 1
+    fi
+    export REDIS_URL="redis://${REDIS_IP}:6379/0"
+  elif command -v redis-cli >/dev/null 2>&1 && redis-cli -u "redis://127.0.0.1:6379/0" ping >/dev/null 2>&1; then
     export REDIS_URL="redis://127.0.0.1:6379/0"
   else
-    REDIS_IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${REDIS_CONTAINER}" 2>/dev/null || true)"
+    REDIS_IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${DEFAULT_REDIS_CONTAINER}" 2>/dev/null || true)"
     if [[ -z "${REDIS_IP}" ]]; then
       echo "[cch-redis-session-puller] cannot resolve redis endpoint" >&2
       exit 1
@@ -26,6 +35,7 @@ if [[ -z "${REDIS_URL:-}" ]]; then
 fi
 
 export EXPORT_ROOT
+export EXPORT_MAX_BYTES
 export DEST_DIR
 export REDIS_SIDECARS_DIR
 export STATE_PATH
